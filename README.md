@@ -1,25 +1,26 @@
-# SlideOn and mSlideOn: Training and Evaluation
+# SlideOn: Training and Evaluation
 
 <p align="center">
   <img src="assets/slideon-mslideon.png" alt="SlideOn and mSlideOn: a golden retriever sliding through a library with a bag of glowing stars" width="512">
 </p>
 
-Training and evaluation scripts for **[SlideOn](https://huggingface.co/lightonai/SlideOn)**,
-our English sparse retriever, and **[mSlideOn](https://huggingface.co/lightonai/mSlideOn)**,
-our multilingual sparse retriever for natural language, long documents, and code.
+This fork of [LightOn's SlideOn and mSlideOn repository](https://github.com/lightonai/slideon-mslideon)
+focuses on faithfully reproducing **[SlideOn](https://huggingface.co/lightonai/SlideOn)**,
+the English sparse retriever by Paulo Roberto Moura Junior and Raphaël Sourty.
+The multilingual training scripts and configurations are excluded from this fork;
+the shared model and evaluation code are retained.
 This repository covers sparse autoencoder (SAE) pretraining, supervised retrieval
 fine-tuning, and evaluation.
 
-SlideOn starts from [DenseOn](https://huggingface.co/lightonai/DenseOn), while
-mSlideOn starts from [mLateOn](https://huggingface.co/lightonai/mLateOn). SAE
-pretraining followed by retrieval fine-tuning converts their token representations
+SlideOn starts from [DenseOn](https://huggingface.co/lightonai/DenseOn). SAE
+pretraining followed by retrieval fine-tuning converts its token representations
 into learned sparse vectors for inverted-index search. Matryoshka training allows
 query and document sparsity to be adjusted at inference to control search and
 storage costs.
 
-For the method, training data, experiments, and results, see our
+For the method, training data, experiments, and results, see the authors'
 [SlideOn and mSlideOn blog post](https://huggingface.co/blog/lightonai/slideon-mslideon).
-The final retrieval models and pretrained SAE initializations are available in our
+The final retrieval models and pretrained SAE initializations are available in their
 [Hugging Face collection](https://huggingface.co/collections/lightonai/slideon-and-mslideon).
 
 ## Install
@@ -32,16 +33,14 @@ pip install -e .
 
 ## Training
 
-Each model has its own editable training scripts under `scripts/`. Data
+Each stage has its own editable training script under `scripts/`. Data
 preparation, losses, and training are implemented directly in those files. `src/slideon/` contains the
 model and checkpoint-loading code.
 
 | Model | Training script | Configuration |
 | --- | --- | --- |
 | [SlideOn-SAE](https://huggingface.co/lightonai/SlideOn-SAE) | [SAE pretraining](scripts/sae-pretrain/train_slideon_sae.py) | [Config](scripts/training-configs/SlideOn-SAE/config.json) |
-| [mSlideOn-SAE](https://huggingface.co/lightonai/mSlideOn-SAE) | [SAE pretraining](scripts/sae-pretrain/train_mslideon_sae.py) | [Config](scripts/training-configs/mSlideOn-SAE/config.json) |
 | [SlideOn](https://huggingface.co/lightonai/SlideOn) | [Retrieval fine-tuning](scripts/finetune/train_slideon.py) | [Config](scripts/training-configs/SlideOn/config.json) |
-| [mSlideOn](https://huggingface.co/lightonai/mSlideOn) | [Retrieval fine-tuning](scripts/finetune/train_mslideon.py) | [Config](scripts/training-configs/mSlideOn/config.json) |
 
 Each script loads its corresponding config automatically. Edit the JSON or pass
 `--config my-config.json`; command-line arguments override its values. Every run
@@ -59,12 +58,8 @@ torchrun --standalone --nproc_per_node=8 scripts/sae-pretrain/train_slideon_sae.
   --cache token-cache/slideon --output outputs/slideon-sae
 ```
 
-For mSlideOn, use `scripts/sae-pretrain/train_mslideon_sae.py` with separate cache and output
-directories. Its config selects mLateOn, multilingual data, and load balancing;
-SlideOn uses DenseOn and AuxK.
-
-Both configs use 32,768 latents, token top-k 32, a global token batch of 4,096,
-and AdamW at 0.0003. Change these and the data selection in the config. Token
+The SAE config selects DenseOn and AuxK, with 32,768 latents, token top-k 32,
+a global token batch of 4,096, and AdamW at 0.0003. Change these and the data selection in the config. Token
 preparation records dataset revisions; `--dataset-revisions pins.json` accepts
 a mapping of dataset IDs to exact commits. The FP16 cache uses two bytes per
 token dimension, so check storage before preparing a full training corpus.
@@ -86,16 +81,13 @@ positive first, then negatives:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/finetune/train_slideon.py \
   --train english.jsonl --output outputs/slideon
-
-CUDA_VISIBLE_DEVICES=0 python scripts/finetune/train_mslideon.py \
-  --train multilingual.jsonl --output outputs/mslideon
 ```
 
-The scripts start from the pinned SAE releases. Pass `--sae outputs/slideon-sae/final`
+The script starts from the pinned SAE release. Pass `--sae outputs/slideon-sae/final`
 to use your own pretrained SAE. Use `torchrun` for multiple GPUs and `--resume PATH`
 for a Trainer checkpoint. The completed model is saved under `final/`.
 
-The scripts expose contrastive and distillation losses, load balancing, FLOPS
+The script exposes contrastive and distillation losses, load balancing, FLOPS
 penalties, and Matryoshka query/document budgets. For example:
 
 ```bash
@@ -122,34 +114,22 @@ pip install -e '.[eval]'
 python scripts/eval/evaluate.py --model lightonai/SlideOn --trust-remote-code \
   --suite beir --query-max-active-dims 32 --document-max-active-dims 512 --output results/slideon
 
-python scripts/eval/evaluate.py --model lightonai/mSlideOn --trust-remote-code \
-  --suite beir miracl mldr code --output results/mslideon
-
 python scripts/eval/evaluate.py --model lightonai/SlideOn --trust-remote-code \
   --suite mteb-eng-v2 --output results/slideon-mteb-eng-v2
-
-python scripts/eval/evaluate.py --model lightonai/mSlideOn --trust-remote-code \
-  --suite mteb-multilingual-v2 --output results/mslideon-mteb-multilingual-v2
 ```
 
-All suites are retrieval only. They cover BEIR-15, [MIRACL hard negatives](https://huggingface.co/datasets/mteb/miracl-hard-negatives)
-(dev), [MLDR](https://huggingface.co/datasets/mteb/MultiLongDocRetrieval) (test), and
-12 code retrieval tasks, plus the retrieval tasks from `MTEB(eng, v2)` (10 tasks)
-and `MTEB(Multilingual, v2)` (18 tasks). The MTEB v2 suites preserve the benchmark's
-evaluation splits and language subsets and exclude the separate `InstructionRetrieval`
-task type. Use `--tasks SciFact` for a smaller run or `--subsets en`
-for the English subsets of MIRACL and MLDR.
+The English workflows cover BEIR-15 and the retrieval tasks from
+`MTEB(eng, v2)` (10 tasks). The MTEB v2 suite preserves the benchmark's
+evaluation splits and language subsets and excludes the separate `InstructionRetrieval`
+task type. Use `--tasks SciFact` for a smaller run.
 
 Evaluation uses exact dot-product search. Vectors are unpruned by default;
 `--query-max-active-dims` and `--document-max-active-dims` control final pruning. Outputs include MTEB
 results, `summary.json` with scores on a 0–1 scale, and `efficiency.json` with
 average nonzeros and retrieval FLOPS (expected active-latent overlap).
-The existing BEIR, MIRACL, MLDR, and code suites report average nDCG@10. The MTEB v2
-suites average each task's main metric across its selected split/subset pairs,
-then average tasks equally. English v2 uses nDCG@10 throughout; multilingual v2
-also includes nDCG@1 for LEMBPasskeyRetrieval and recall@10 for
-StatcanDialogueDatasetRetrieval. These averages describe the retrieval slices,
-not the full MTEB benchmarks.
+BEIR reports average nDCG@10. The English MTEB v2 suite averages each task's
+nDCG@10 across its selected split/subset pairs, then averages tasks equally.
+This average describes the retrieval slice, not the full MTEB benchmark.
 
 Use `--revision` to pin a checkpoint. Lower `--batch-size` for encoder memory or
 `--query-batch` / `--document-chunk` for scoring memory. Corpus vectors stay in
@@ -172,13 +152,13 @@ saved unpruned defaults. Positive budgets larger than the embedding dimension
 keep all dimensions. `0` is invalid. `token_k` controls the independent per-token
 activation budget (32 by default).
 
-Use `lightonai/mSlideOn` for multilingual retrieval, or the `final/` directory
-from your own run. Saved models include their backbone, sparse head, tokenizer,
+Use the `final/` directory from your own run to load a locally trained model.
+Saved models include their backbone, sparse head, tokenizer,
 and loading code.
 
 ## Citation
 
-If you find this work useful for your research, please consider citing us:
+If you find this work useful for your research, please consider citing the original authors:
 
 ```bibtex
 @misc{moura2026slideon,
