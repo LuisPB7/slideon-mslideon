@@ -22,10 +22,15 @@ from scipy import sparse
 BEIR = ("ArguAna", "CQADupstackRetrieval", "ClimateFEVER", "DBPedia", "FEVER", "FiQA2018",
         "HotpotQA", "MSMARCO", "NFCorpus", "NQ", "QuoraRetrieval", "SCIDOCS", "SciFact",
         "TRECCOVID", "Touche2020")
+# A nine-task subset for quicker evaluation, using the original BEIR datasets.
+# DBPedia is MTEB's task name for DBPedia-Entity.
+BEIR_SMALL = tuple(task for task in BEIR if task not in {
+    "ClimateFEVER", "DBPedia", "HotpotQA", "MSMARCO", "NQ", "FEVER"})
 CODE = ("CodeSearchNetCCRetrieval", "COIRCodeSearchNetRetrieval", "CodeFeedbackST",
         "SyntheticText2SQL", "CodeFeedbackMT", "CodeEditSearchRetrieval", "StackOverflowQA",
         "CosQA", "AppsRetrieval", "CodeSearchNetRetrieval", "CodeTransOceanContest", "CodeTransOceanDL")
-SUITES = dict(beir=BEIR, miracl=("MIRACLRetrievalHardNegatives",), mldr=("MultiLongDocRetrieval",), code=CODE)
+SUITES = {"beir": BEIR, "BEIR-Small": BEIR_SMALL,
+          "miracl": ("MIRACLRetrievalHardNegatives",), "mldr": ("MultiLongDocRetrieval",), "code": CODE}
 MTEB_SUITES = {
     "mteb-eng-v2": "MTEB(eng, v2)",
     "mteb-multilingual-v2": "MTEB(Multilingual, v2)",
