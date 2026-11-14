@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "slideon-mslideon"
 version = "0.1.0"
 description = "Token-level sparse autoencoder retrieval with SentenceTransformers"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
   "sentence-transformers>=6.1,<6.2",
   "transformers>=5.3,<6",
