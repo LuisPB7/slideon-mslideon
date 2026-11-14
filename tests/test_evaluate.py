@@ -16,6 +16,11 @@ from unittest import mock
 
 import torch
 from sentence_transformers import SparseEncoder
+from sentence_transformers.base.modules import InputModule
+from tokenizers import Tokenizer, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
+
+from slideon.models import SlideOn
 
 from test_finetune import TinyInput
 
@@ -26,6 +31,79 @@ SPEC = importlib.util.spec_from_file_location(
 )
 evaluate = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(evaluate)
+
+
+class EvaluationLengthTests(unittest.TestCase):
+    @staticmethod
+    def adapter(query_length=128, document_length=128):
+        # Exercise the real SlideOn tokenizer path without loading a backbone.
+        adapter = SlideOn.__new__(SlideOn)
+        InputModule.__init__(adapter)
+        tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0, "[PAD]": 1, "word": 2}, unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        adapter.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer, unk_token="[UNK]", pad_token="[PAD]"
+        )
+        adapter.settings = {
+            "query_length": query_length, "document_length": document_length,
+            "prompts": {"query": "", "document": ""},
+        }
+        adapter.encoder_config = {}
+        adapter.max_seq_length = max(query_length, document_length)
+        return adapter
+
+    def assert_lengths(self, adapter, query_length, document_length):
+        text = " ".join(["word"] * 600)
+        for role, expected in (("query", query_length), ("document", document_length)):
+            features = adapter.preprocess([text], task=role)
+            self.assertEqual(features["input_ids"].shape, (1, expected))
+            self.assertEqual(features["attention_mask"].sum().item(), expected)
+
+    def test_default_is_noop_even_for_non_slideon_encoder(self):
+        # With no flag, generic checkpoints keep the old evaluation behavior.
+        self.assertIsNone(evaluate.apply_length_overrides(object()))
+        adapter = self.adapter()
+        original_settings = dict(adapter.settings)
+        self.assertIsNone(evaluate.apply_length_overrides([adapter]))
+        self.assertEqual(adapter.settings, original_settings)
+        self.assertEqual(adapter.max_seq_length, 128)
+        self.assert_lengths(adapter, 128, 128)
+
+    def test_lengths_can_increase_beyond_checkpoint_cap(self):
+        adapter = self.adapter()
+        effective = evaluate.apply_length_overrides([adapter], query_length=256, document_length=512)
+        self.assertEqual(effective, {"query_length": 256, "document_length": 512})
+        self.assertEqual(adapter.max_seq_length, 512)
+        self.assert_lengths(adapter, 256, 512)
+
+    def test_single_role_override_preserves_the_other_saved_length(self):
+        for kwargs, expected in (({"query_length": 256}, (256, 128)),
+                                 ({"document_length": 64}, (128, 64))):
+            with self.subTest(kwargs=kwargs):
+                adapter = self.adapter()
+                effective = evaluate.apply_length_overrides([adapter], **kwargs)
+                self.assertEqual(effective, dict(zip(("query_length", "document_length"), expected)))
+                self.assertEqual(adapter.max_seq_length, max(expected))
+                self.assert_lengths(adapter, *expected)
+
+    def test_both_limits_can_shorten_checkpoint_defaults(self):
+        adapter = self.adapter()
+        evaluate.apply_length_overrides([adapter], query_length=32, document_length=64)
+        self.assertEqual(adapter.max_seq_length, 64)
+        self.assert_lengths(adapter, 32, 64)
+
+    def test_invalid_cli_limits_fail_before_checkpoint_lookup_or_loading(self):
+        for flag in ("--query-length", "--document-length"):
+            for value in ("0", "-1"):
+                with self.subTest(flag=flag, value=value), \
+                     mock.patch.object(evaluate, "resolve_checkpoint") as resolve, \
+                     mock.patch("sentence_transformers.SparseEncoder") as load, \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        evaluate.main(["--model", "unused/model", "--output", "unused-output", flag, value])
+                    self.assertEqual(error.exception.code, 2)
+                    resolve.assert_not_called()
+                    load.assert_not_called()
 
 
 class EvaluateCheckpointTests(unittest.TestCase):
@@ -128,7 +206,8 @@ class EvaluateCheckpointTests(unittest.TestCase):
         for key, value in model.state_dict().items():
             torch.testing.assert_close(value, loaded.state_dict()[key], rtol=0, atol=0)
 
-    def _run_main(self, model, output, *, revision=None, query_budget=64):
+    def _run_main(self, model, output, *, revision=None, query_budget=64,
+                  query_length=None, document_length=None):
         import mteb
         task = SimpleNamespace(metadata=SimpleNamespace(
             name="ToyRetrieval", type="Retrieval", eval_splits=["test"], main_score="ndcg_at_10"
@@ -136,7 +215,8 @@ class EvaluateCheckpointTests(unittest.TestCase):
         result = SimpleNamespace(task_name="ToyRetrieval", scores={
             "test": [{"hf_subset": "default", "ndcg_at_10": 0.5}]
         })
-        encoder = mock.Mock()
+        encoder = mock.MagicMock()
+        encoder.__getitem__.return_value = EvaluationLengthTests.adapter()
         encoder.device = torch.device("cpu")
         encoder.encode_query.return_value = torch.eye(2)
         encoder.encode_document.return_value = torch.eye(2)
@@ -155,6 +235,10 @@ class EvaluateCheckpointTests(unittest.TestCase):
                 "--document-max-active-dims", "512"]
         if revision is not None:
             argv += ["--revision", revision]
+        if query_length is not None:
+            argv += ["--query-length", str(query_length)]
+        if document_length is not None:
+            argv += ["--document-length", str(document_length)]
         with mock.patch.object(evaluate, "select_suites", return_value=([task], {"beir": ["ToyRetrieval"]})), \
              mock.patch.object(mteb, "evaluate", side_effect=run_task) as run, \
              mock.patch("sentence_transformers.SparseEncoder", return_value=encoder) as load, \
@@ -166,6 +250,8 @@ class EvaluateCheckpointTests(unittest.TestCase):
         self.assertEqual(encoder.encode_document.call_args.kwargs["max_active_dims"], 512)
         self.assertEqual(searches[0].query_max_active_dims, query_budget)
         self.assertEqual(searches[0].document_max_active_dims, 512)
+        if query_length is None and document_length is None:
+            encoder.__getitem__.assert_not_called()
         summary = json.loads((output / "summary.json").read_text())
         self.assertEqual(summary["suites"]["beir"]["ndcg_at_10"], 0.5)
         return load.call_args, json.loads((output / "run_config.json").read_text()), searches[0]
@@ -203,6 +289,30 @@ class EvaluateCheckpointTests(unittest.TestCase):
         self.assertEqual(config["revision"], sha)
         self.assertEqual(set(config), {"model", "revision", "mteb_version", "score", "suites",
                                      "query_max_active_dims", "document_max_active_dims", "batch_size", "tasks"})
+
+    def test_length_overrides_isolate_local_and_hub_caches_and_guard_outputs(self):
+        for model, label in ((self.checkpoint, "local"), ("lightonai/SlideOn", "hub")):
+            with self.subTest(source=label), \
+                 mock.patch("huggingface_hub.HfApi.model_info", return_value=SimpleNamespace(sha="b" * 40)):
+                _, default_config, default_search = self._run_main(model, self.root / f"{label}-default")
+                output = self.root / f"{label}-lengths"
+                _, config, search = self._run_main(model, output, query_length=256)
+                self.assertEqual(config["query_length"], 256)
+                self.assertIsNone(config["document_length"])
+                self.assertEqual(config["resolved_lengths"], {"query_length": 256, "document_length": 128})
+                self.assertNotIn("resolved_lengths", default_config)
+                self.assertNotEqual(search.mteb_model_meta.name, default_search.mteb_model_meta.name)
+                self.assertEqual(search.mteb_model_meta.revision, default_search.mteb_model_meta.revision)
+                EvaluationLengthTests().assert_lengths(search.model[0], 256, 128)
+                # An identical override may resume; any change must use new output.
+                self._run_main(model, output, query_length=256)
+                for kwargs in ({}, {"query_length": 512}, {"query_length": 256, "document_length": 64}):
+                    with self.subTest(changed=kwargs), self.assertRaisesRegex(ValueError, "different evaluation configuration"):
+                        self._run_main(model, output, **kwargs)
+                _, _, changed_search = self._run_main(
+                    model, self.root / f"{label}-changed-lengths", query_length=512, document_length=64
+                )
+                self.assertNotEqual(search.mteb_model_meta.name, changed_search.mteb_model_meta.name)
 
 
 if __name__ == "__main__":

@@ -86,6 +86,31 @@ def resolve_checkpoint(model, revision=None):
                 load_kwargs={"revision": commit})
 
 
+def apply_length_overrides(model, query_length=None, document_length=None):
+    """Override SlideOn's tokenizer limits in memory, keeping omitted roles saved."""
+    # With no override, leave every checkpoint setting untouched. This also
+    # preserves evaluation of other SparseEncoder architectures.
+    if query_length is None and document_length is None:
+        return None
+    module = model[0]
+    settings = getattr(module, "settings", None)
+    if not isinstance(settings, dict) or any(
+        type(settings.get(key)) is not int or settings[key] < 1
+        for key in ("query_length", "document_length")
+    ):
+        raise ValueError("Length overrides require a SlideOn adapter with saved query/document lengths")
+    lengths = dict(query_length=settings["query_length"] if query_length is None else query_length,
+                   document_length=settings["document_length"] if document_length is None else document_length)
+    if any(type(length) is not int or length < 1 for length in lengths.values()):
+        raise ValueError("Query and document lengths must be positive integers")
+    settings.update(lengths)
+    # preprocess() takes min(max_seq_length, role_length). Raise this outer cap
+    # as well when evaluating longer inputs than those used during fine-tuning.
+    # Positional-embedding settings and the checkpoint on disk are not changed.
+    module.max_seq_length = max(lengths.values())
+    return lengths
+
+
 def write_json(path, value):
     # Replace a completed record atomically within its directory. Incremental
     # evaluation updates should not leave truncated JSON if serialization fails.
@@ -358,6 +383,10 @@ def main(argv=None):
     parser.add_argument("--output", required=True)
     parser.add_argument("--query-max-active-dims", type=int, default=None, help="Positive final vector budget; omit for unpruned")
     parser.add_argument("--document-max-active-dims", type=int, default=None, help="Positive final vector budget; omit for unpruned")
+    parser.add_argument("--query-length", type=int, default=None,
+                        help="Override query token limit, including prompt/special tokens; omit to use checkpoint setting")
+    parser.add_argument("--document-length", type=int, default=None,
+                        help="Override document token limit, including prompt/special tokens; omit to use checkpoint setting")
     parser.add_argument("--batch-size", type=int, default=8, help="Encoder batch size")
     parser.add_argument("--query-batch", type=int, default=64, help="Scoring query block size")
     parser.add_argument("--document-chunk", type=int, default=16384, help="Scoring document block size")
@@ -371,6 +400,8 @@ def main(argv=None):
         cap is not None and cap <= 0 for cap in (args.query_max_active_dims, args.document_max_active_dims)
     ):
         parser.error("Invalid batch size or pruning budget")
+    if any(length is not None and length < 1 for length in (args.query_length, args.document_length)):
+        parser.error("Query and document lengths must be positive integers")
     import mteb
     from mteb.cache import ResultCache
     from sentence_transformers import SparseEncoder
@@ -397,23 +428,42 @@ def main(argv=None):
                   tasks={t.metadata.name: dict(splits=list(t.metadata.eval_splits), subsets=list(t.hf_subsets)) for t in tasks})
     if checkpoint["local"]:
         config.update(checkpoint_source="local", mteb_model_id=checkpoint["model_id"])
+    length_override = args.query_length is not None or args.document_length is not None
+    model_id = checkpoint["model_id"]
+    if length_override:
+        # Keep the real checkpoint revision for loading. Only the result-cache
+        # identity receives a suffix; omitted flags retain existing cache keys.
+        model_id += f"-qlen-{args.query_length or 'saved'}-dlen-{args.document_length or 'saved'}"
+        config.update(query_length=args.query_length, document_length=args.document_length,
+                      mteb_model_id=model_id)
     output.mkdir(parents=True, exist_ok=True)
     config_path = output / "run_config.json"
     # Reusing a directory is allowed only with the same recorded configuration.
     # This protects comparisons from mixing checkpoints, budgets, or task scopes.
-    if config_path.exists() and json.loads(config_path.read_text()) != config:
-        raise ValueError("Output contains a different evaluation configuration; use another directory")
+    if config_path.exists():
+        previous = json.loads(config_path.read_text())
+        # Resolved lengths are derived again from the pinned checkpoint after
+        # loading. Compare explicit requests here to reject mixed runs early.
+        if length_override:
+            previous.pop("resolved_lengths", None)
+        if previous != config:
+            raise ValueError("Output contains a different evaluation configuration; use another directory")
     if not config_path.exists() and any(output.iterdir()):
         raise ValueError("Use an empty output directory")
-    write_json(config_path, config)
 
     # 3. Load the checkpoint's Sentence Transformers adapter and switch it to
     # inference behavior. The model handles text->vector conversion; the wrapper
     # below handles corpus storage and exact dot-product ranking.
     model = SparseEncoder(checkpoint["model"], **checkpoint["load_kwargs"],
                           trust_remote_code=args.trust_remote_code, device=args.device)
+    resolved_lengths = apply_length_overrides(model, args.query_length, args.document_length)
+    if resolved_lengths is not None:
+        config["resolved_lengths"] = resolved_lengths
+        print(f"Evaluation token limits: query={resolved_lengths['query_length']}, "
+              f"document={resolved_lengths['document_length']}", flush=True)
+    write_json(config_path, config)
     model.eval()
-    search = ExactRetrieval(model, checkpoint["model_id"], revision, output, args.batch_size, args.query_max_active_dims,
+    search = ExactRetrieval(model, model_id, revision, output, args.batch_size, args.query_max_active_dims,
                             args.document_max_active_dims, args.query_batch, args.document_chunk)
     cache = ResultCache(output / "mteb")
     results = []
