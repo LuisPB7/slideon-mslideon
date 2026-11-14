@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Run from any directory: bash /path/to/slideon/run_finetune.sh
 # One-time setup in your Python environment: pip install -e '.[eval]'
+# Single GPU (default: GPU 0): CUDA_VISIBLE_DEVICES=2 bash run_finetune.sh
+# Multiple GPUs on one node: CUDA_VISIBLE_DEVICES=0,1,2,3 bash run_finetune.sh
+# Preprocessing runs once; evaluation uses the first selected GPU after training.
 set -euo pipefail
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,14 +38,22 @@ fi
 # 2. Fine-tune from the released SAE pinned in the original training config.
 # All model/loss/optimizer settings remain in that config. Only data sampling
 # changes here. Extra arguments are forwarded, e.g. --resume path/to/checkpoint.
-"$PYTHON" scripts/finetune/train_slideon.py \
+# A list of visible GPUs selects one distributed worker per available GPU.
+# Use the active Python environment for torchrun too. The trainer derives
+# accumulation from GPU count to preserve the configured global batch size.
+TRAIN_COMMAND=("$PYTHON")
+if [[ "$CUDA_VISIBLE_DEVICES" == *,* ]]; then
+    TRAIN_COMMAND+=(-m torch.distributed.run --standalone --nproc_per_node=gpu)
+fi
+"${TRAIN_COMMAND[@]}" scripts/finetune/train_slideon.py \
     --train "$TRAIN_JSONL" --output "$SFT_OUTPUT" \
     --source-sampling-alpha 0.5 --sample-negatives 7 \
     "$@"
 
 # 3. Evaluate the just-trained local model on BEIR-15 with q64/d512 caps.
 # set -e above prevents this step from running after failed training.
-"$PYTHON" scripts/eval/evaluate.py \
+# torchrun has finished, so evaluation runs once outside the distributed job.
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}" "$PYTHON" scripts/eval/evaluate.py \
     --model "$SFT_OUTPUT/final" --trust-remote-code --suite beir \
     --query-max-active-dims 64 --document-max-active-dims 512 \
     --output "$EVAL_OUTPUT"
