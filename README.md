@@ -168,6 +168,39 @@ released metrics has not been established.
 
 ## Evaluation
 
+`run_eval.sh` evaluates one checkpoint per run. Edit its settings at the top, or
+override them with environment variables:
+
+```bash
+bash run_eval.sh
+
+MODEL_ID_OR_PATH=outputs/slideon-alpha05-neg7/final \
+  EVAL_SUITE=BEIR-Small QUERY_LENGTH=128 DOCUMENT_LENGTH=128 \
+  EVAL_OUTPUT=results/our-finetune-small-128 bash run_eval.sh
+```
+
+The default evaluates the released fine-tuned `lightonai/SlideOn` on BEIR with
+64 query / 512 document active dimensions. `QUERY_LENGTH` and `DOCUMENT_LENGTH`
+default to empty strings, preserving each checkpoint's saved token limit;
+either can be overridden independently. `BATCH_SIZE` defaults to 8. An empty
+`EVAL_OUTPUT` generates a directory under `results/` named from the model, suite,
+token limits and sparsity settings.
+
+| Weights | `MODEL_ID_OR_PATH` example |
+| --- | --- |
+| Released SAE | `lightonai/SlideOn-SAE` |
+| Our pretrained SAE | `outputs/slideon-sae/final` |
+| Released fine-tuned model | `lightonai/SlideOn` |
+| Our fine-tuned model | `outputs/slideon-alpha05-neg7/final` |
+
+Relative paths are resolved from the repository. `MODEL_REVISION=auto` preserves
+the launcher's existing release pins for the two author models and omits a Hub
+revision for local paths. Set an explicit commit for another Hub revision, or an
+empty string to resolve the current default branch. Use a new output directory
+when changing the revision or other evaluation settings.
+
+The same Python entry point can also be called directly:
+
 ```bash
 pip install -e '.[eval]'
 python scripts/eval/evaluate.py --model lightonai/SlideOn --trust-remote-code \
@@ -183,22 +216,29 @@ python scripts/eval/evaluate.py \
   --output outputs/slideon-alpha05-neg7/beir-q64-d512
 ```
 
-`--model` accepts a Hub ID or a complete local Sentence Transformers checkpoint
-(`final/` or `checkpoint-N/`, containing `modules.json`). Local model assets are
-loaded directly from disk; benchmark datasets may still require downloads.
-Raw SAE dictionaries and the parent training-output directory are not complete
-evaluation checkpoints.
+`--model` accepts a Hub ID, a complete local Sentence Transformers checkpoint
+(`final/` or `checkpoint-N/`, containing `modules.json`), or a local raw SAE
+checkpoint (`config.json` plus `sae.safetensors`). Pass the checkpoint itself,
+not its parent training-output directory. Complete local models load directly
+from disk. For raw SAE checkpoints, the evaluator uses the existing SAE loader
+to attach the recorded backbone and preserve saved query/document lengths;
+the backbone may need downloading. This temporary conversion does not modify
+the checkpoint. Benchmark datasets may also require downloads.
 
 For a local model, `run_config.json` records the resolved path and a SHA256
 fingerprint of the inference files. Changed weights, tokenizer, configuration or
 custom code require a new evaluation output directory, preventing stale scores
 from being reused. Optimizer state and generated caches are excluded from this
-fingerprint. Keep evaluation output outside the checkpoint directory.
+fingerprint. Raw SAE fingerprints also include the resolved backbone commit and
+local conversion code, and exclude training resume state. Keep evaluation output
+outside the checkpoint directory.
 
 The English workflows cover BEIR-15 and the retrieval tasks from
 `MTEB(eng, v2)` (10 tasks). The MTEB v2 suite preserves the benchmark's
 evaluation splits and language subsets and excludes the separate `InstructionRetrieval`
-task type. Use `--tasks SciFact` for a smaller run.
+task type. `--suite BEIR-Small` selects the nine BEIR datasets remaining after
+excluding ClimateFEVER, DBPedia, HotpotQA, MSMARCO, NQ and FEVER.
+Use `--tasks SciFact` for a single-dataset run.
 
 Evaluation uses exact dot-product search. Vectors are unpruned by default;
 `--query-max-active-dims` and `--document-max-active-dims` control final pruning. Outputs include MTEB
@@ -209,6 +249,8 @@ nDCG@10 across its selected split/subset pairs, then averages tasks equally.
 This average describes the retrieval slice, not the full MTEB benchmark.
 
 Use `--revision` to pin a Hub checkpoint; omit it for local directories.
+Use `--query-length` and/or `--document-length` to override saved token limits
+for evaluation only; omitting either preserves that role's saved limit.
 Lower `--batch-size` for encoder memory or
 `--query-batch` / `--document-chunk` for scoring memory. Corpus vectors stay in
 host RAM. Use a separate output directory for each configuration.
@@ -230,9 +272,9 @@ saved unpruned defaults. Positive budgets larger than the embedding dimension
 keep all dimensions. `0` is invalid. `token_k` controls the independent per-token
 activation budget (32 by default).
 
-Use the `final/` directory from your own run to load a locally trained model.
-Saved models include their backbone, sparse head, tokenizer,
-and loading code.
+Use the `final/` directory from your own fine-tuning run to load a locally trained
+model this way. Saved fine-tuned models include their backbone, sparse head,
+tokenizer and loading code; raw SAE outputs need assembly as described above.
 
 ## Citation
 

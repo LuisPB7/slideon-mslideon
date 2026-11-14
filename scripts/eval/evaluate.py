@@ -37,7 +37,7 @@ MTEB_SUITES = {
 }
 
 
-def checkpoint_digest(directory):
+def checkpoint_digest(directory, files=None):
     """Fingerprint local inference files so replaced weights cannot reuse scores.
 
     Include nested modules, tokenizer/config files, weight shards and custom
@@ -47,7 +47,7 @@ def checkpoint_digest(directory):
     ignored = {"optimizer.pt", "optimizer.bin", "scheduler.pt", "scaler.pt",
                "training_args.bin", "trainer_state.json", "run_config.json", "README.md"}
     digest = hashlib.sha256()
-    for path in sorted(directory.rglob("*")):
+    for path in sorted(directory.rglob("*") if files is None else files):
         relative = path.relative_to(directory)
         if (not path.is_file() or any(part in {"__pycache__", ".git", ".cache"} for part in relative.parts)
                 or path.name in ignored or path.match("rng_state*.pth")
@@ -63,6 +63,44 @@ def checkpoint_digest(directory):
     return digest.hexdigest()
 
 
+def raw_sae_loader_fingerprint():
+    """Identify the local code used to assemble a raw SAE into a retriever."""
+    from slideon import loading
+    directory = Path(loading.__file__).resolve().parent
+    return checkpoint_digest(directory, files=[directory / name for name in
+        ("loading.py", "export.py", "models.py", "modeling_slideon.py")])
+
+
+def resolve_raw_sae(directory):
+    """Validate the saved SAE recipe and pin its separately loaded backbone."""
+    config = json.loads((directory / "config.json").read_text())
+    if not isinstance(config, dict) or config.get("model_type") == "slideon":
+        raise ValueError("Expected a raw SAE recipe; flat SlideOn checkpoints need modules.json")
+    for key in ("query_length", "document_length", "n_latents", "k"):
+        if type(config.get(key)) is not int or config[key] < 1:
+            raise ValueError(f"Raw SAE config requires a positive integer {key}")
+    if config["k"] > config["n_latents"] or not config.get("normalized_inputs", True):
+        raise ValueError("Raw SAE requires normalized inputs and k <= n_latents")
+    base_model = config.get("base_model")
+    if not isinstance(base_model, str) or not base_model.strip():
+        raise ValueError("Raw SAE config requires base_model")
+    revision = config.get("base_model_revision")
+    if revision is not None and (not isinstance(revision, str) or not revision.strip()):
+        raise ValueError("Raw SAE base_model_revision must be a commit, tag, branch, or null")
+    # Match from_sae's historical DenseOn fallback, then resolve any mutable
+    # reference once. The exact same commit enters both loading and cache keys.
+    if revision is None and base_model == "lightonai/DenseOn":
+        revision = "cb9947ebccb33862d24e3c7ca2edb25e51acd887"
+    if revision is None or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        from huggingface_hub import HfApi
+        revision = HfApi().model_info(base_model, revision=revision).sha
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        raise ValueError("Could not resolve the raw SAE backbone to an immutable commit")
+    return dict(base_model=base_model, backbone_revision=revision.lower(),
+                query_length=config["query_length"], document_length=config["document_length"],
+                loader_fingerprint=raw_sae_loader_fingerprint())
+
+
 def resolve_checkpoint(model, revision=None):
     """Separate the model loading target from its stable MTEB cache identity."""
     path = Path(model).expanduser()
@@ -70,15 +108,28 @@ def resolve_checkpoint(model, revision=None):
         path = path.resolve()
         if revision is not None:
             raise ValueError("--revision applies only to Hugging Face models, not local checkpoints")
+        raw_sae = None
         if not (path / "modules.json").is_file():
-            raise ValueError("Local checkpoint needs modules.json; pass a fine-tuning final/ or checkpoint-N/ directory")
+            if not all((path / name).is_file() for name in ("config.json", "sae.safetensors")):
+                raise ValueError("Local checkpoint needs modules.json, or a raw SAE config.json and sae.safetensors")
+            raw_sae = resolve_raw_sae(path)
+            # A raw checkpoint's optimizer/resume state is irrelevant to
+            # retrieval. Its head, recipe, backbone commit and conversion code
+            # completely identify the inference artifact assembled below.
+            digest = checkpoint_digest(path, files=[path / "config.json", path / "sae.safetensors"])
+            digest = hashlib.sha256((digest + json.dumps(raw_sae, sort_keys=True)).encode("utf-8")).hexdigest()
+        else:
+            digest = checkpoint_digest(path)
         # MTEB expects an owner/name identifier. Do not use an absolute path as
         # its model name, or pass our synthetic revision to SparseEncoder.
         name = re.sub(r"[^A-Za-z0-9._-]+", "-", path.name) or "checkpoint"
         location = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:12]
-        return dict(model=str(path), model_id=f"local/{name}-{location}",
-                    revision="sha256-" + checkpoint_digest(path), local=True,
-                    load_kwargs={"local_files_only": True})
+        resolved = dict(model=str(path), model_id=f"local/{name}-{location}",
+                        revision="sha256-" + digest, local=True,
+                        load_kwargs={"local_files_only": True})
+        if raw_sae is not None:
+            resolved["raw_sae"] = raw_sae
+        return resolved
     if path.exists():
         raise ValueError("--model must point to a checkpoint directory, not an individual file")
     if str(model).startswith((".", "~", os.sep)) or len(path.parts) > 2:
@@ -89,6 +140,21 @@ def resolve_checkpoint(model, revision=None):
     commit = HfApi().model_info(model, revision=revision).sha
     return dict(model=model, model_id=model, revision=commit, local=False,
                 load_kwargs={"revision": commit})
+
+
+def load_evaluation_model(checkpoint, *, trust_remote_code, device):
+    """Load a complete checkpoint or assemble our raw SAE without editing it."""
+    raw_sae = checkpoint.get("raw_sae")
+    if raw_sae is not None:
+        if not trust_remote_code:
+            raise ValueError("Raw SAE evaluation requires --trust-remote-code for the assembled SlideOn adapter")
+        from slideon.loading import from_sae
+        return from_sae(checkpoint["model"], backbone_revision=raw_sae["backbone_revision"],
+                        query_length=raw_sae["query_length"], document_length=raw_sae["document_length"],
+                        device=device)
+    from sentence_transformers import SparseEncoder
+    return SparseEncoder(checkpoint["model"], **checkpoint["load_kwargs"],
+                         trust_remote_code=trust_remote_code, device=device)
 
 
 def apply_length_overrides(model, query_length=None, document_length=None):
@@ -376,7 +442,7 @@ def main(argv=None):
     # exclusive; omitting both selects BEIR. Encoding and scoring chunk sizes
     # are separate because they constrain different intermediate allocations.
     parser = argparse.ArgumentParser(description="Evaluate a Hub or local sparse checkpoint with exact dot search")
-    parser.add_argument("--model", required=True, help="Hugging Face model ID or local final/checkpoint directory")
+    parser.add_argument("--model", required=True, help="Hugging Face model ID or local SAE/fine-tuning final/checkpoint directory")
     parser.add_argument("--revision", help="Hub models only: optional commit/tag; resolved commit is recorded")
     parser.add_argument("--trust-remote-code", action="store_true", help="Allow the checkpoint's custom ST adapter")
     group = parser.add_mutually_exclusive_group()
@@ -409,7 +475,6 @@ def main(argv=None):
         parser.error("Query and document lengths must be positive integers")
     import mteb
     from mteb.cache import ResultCache
-    from sentence_transformers import SparseEncoder
 
     checkpoint = resolve_checkpoint(args.model, args.revision)
     output = Path(args.output)
@@ -433,6 +498,8 @@ def main(argv=None):
                   tasks={t.metadata.name: dict(splits=list(t.metadata.eval_splits), subsets=list(t.hf_subsets)) for t in tasks})
     if checkpoint["local"]:
         config.update(checkpoint_source="local", mteb_model_id=checkpoint["model_id"])
+    if "raw_sae" in checkpoint:
+        config["raw_sae"] = checkpoint["raw_sae"]
     length_override = args.query_length is not None or args.document_length is not None
     model_id = checkpoint["model_id"]
     if length_override:
@@ -459,8 +526,7 @@ def main(argv=None):
     # 3. Load the checkpoint's Sentence Transformers adapter and switch it to
     # inference behavior. The model handles text->vector conversion; the wrapper
     # below handles corpus storage and exact dot-product ranking.
-    model = SparseEncoder(checkpoint["model"], **checkpoint["load_kwargs"],
-                          trust_remote_code=args.trust_remote_code, device=args.device)
+    model = load_evaluation_model(checkpoint, trust_remote_code=args.trust_remote_code, device=args.device)
     resolved_lengths = apply_length_overrides(model, args.query_length, args.document_length)
     if resolved_lengths is not None:
         config["resolved_lengths"] = resolved_lengths

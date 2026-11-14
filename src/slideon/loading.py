@@ -49,7 +49,10 @@ def from_pretrained(checkpoint, revision=None, **kwargs):
 # requested sequence limits. The training script overrides these helper defaults
 # with its own JSON values (8,192 for each role in the English baseline).
 def from_sae(checkpoint, revision=None, backbone_revision=None, query_length=128,
-             document_length=512):
+             document_length=512, device=None):
+    # Evaluation may request CPU or a particular GPU before weights are loaded.
+    # Omitting device retains Sentence Transformers' existing automatic choice.
+    device_kwargs = {} if device is None else {"device": device}
     source = Path(checkpoint)
     if not source.is_dir():
         config_path = Path(hf_hub_download(str(checkpoint), "config.json", revision=revision))
@@ -65,7 +68,7 @@ def from_sae(checkpoint, revision=None, backbone_revision=None, query_length=128
             raise ValueError("from_sae requires an SAE initialization checkpoint")
         if backbone_revision is not None and backbone_revision != config.get("base_model_revision"):
             raise ValueError("The flat SAE bundles its backbone; a different revision requires a raw SAE")
-        model = from_pretrained(checkpoint, revision=revision)
+        model = from_pretrained(checkpoint, revision=revision, **device_kwargs)
         model[0].settings.update(query_length=query_length, document_length=document_length)
         model[0].max_seq_length = max(query_length, document_length)
         return model
@@ -135,4 +138,4 @@ def from_sae(checkpoint, revision=None, backbone_revision=None, query_length=128
         # also copies local adapter/core Python files into this new checkpoint.
         with tempfile.TemporaryDirectory(prefix="slideon-export-") as flat:
             export_legacy_checkpoint(root, flat, sae_checkpoint=source)
-            return SparseEncoder(flat, trust_remote_code=True)
+            return SparseEncoder(flat, trust_remote_code=True, **device_kwargs)
