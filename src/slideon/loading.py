@@ -16,8 +16,8 @@ from sentence_transformers import SparseEncoder
 
 # General loader for complete retrieval/SAE models or an older encoder/head
 # directory. Returns a Sentence Transformers SparseEncoder in every branch.
-# This accepts local directories as well as Hub IDs; the evaluation CLI has
-# a separate unconditional Hub metadata lookup and is more restrictive.
+# This accepts local directories as well as Hub IDs. The evaluation CLI directly
+# loads complete ST checkpoints; raw SAE conversion remains this loader's job.
 def from_pretrained(checkpoint, revision=None, **kwargs):
     # Inspect only config.json first to distinguish formats before downloading
     # all weights. Existing directories take the local path; other strings are

@@ -87,17 +87,23 @@ The script starts from the pinned SAE release. Pass `--sae outputs/slideon-sae/f
 to use your own pretrained SAE. Use `torchrun` for multiple GPUs and `--resume PATH`
 for a Trainer checkpoint. The completed model is saved under `final/`.
 
-To prepare the authors' English data and enable source/negative sampling, run:
+To prepare the authors' English data, fine-tune and evaluate the local result, run:
 
 ```bash
+pip install -e '.[eval]'
 bash run_finetune.sh
 ```
 
 The launcher creates `english.jsonl` if it is missing, then fine-tunes from the
 released SAE using `--source-sampling-alpha 0.5 --sample-negatives 7`. It retains
 the existing training configuration and writes to `outputs/slideon-alpha05-neg7`.
-Set `PYTHON`, `TRAIN_JSONL`, `SFT_OUTPUT`, or `CUDA_VISIBLE_DEVICES` in the shell to
-override those launcher settings. Additional arguments go to the training script,
+After successful training, it evaluates that directory's `final/` model on BEIR-15
+with 64 query / 512 document active dimensions. Evaluation results go to
+`outputs/slideon-alpha05-neg7/beir-q64-d512`, including `summary.json`.
+Set `PYTHON`, `TRAIN_JSONL`, `SFT_OUTPUT`, `EVAL_OUTPUT`, or `CUDA_VISIBLE_DEVICES`
+in the shell to override launcher settings. Use `SFT_OUTPUT` rather than forwarding
+`--output`, so training and evaluation always refer to the same run.
+Additional arguments go to the training script,
 for example `bash run_finetune.sh --resume outputs/slideon-alpha05-neg7/checkpoint-500`.
 
 The converter can also be run separately:
@@ -165,11 +171,29 @@ released metrics has not been established.
 ```bash
 pip install -e '.[eval]'
 python scripts/eval/evaluate.py --model lightonai/SlideOn --trust-remote-code \
-  --suite beir --query-max-active-dims 32 --document-max-active-dims 512 --output results/slideon
+  --suite beir --query-max-active-dims 64 --document-max-active-dims 512 --output results/slideon
 
 python scripts/eval/evaluate.py --model lightonai/SlideOn --trust-remote-code \
   --suite mteb-eng-v2 --output results/slideon-mteb-eng-v2
+
+# Evaluate an already fine-tuned local model without running training again:
+python scripts/eval/evaluate.py \
+  --model outputs/slideon-alpha05-neg7/final --trust-remote-code \
+  --suite beir --query-max-active-dims 64 --document-max-active-dims 512 \
+  --output outputs/slideon-alpha05-neg7/beir-q64-d512
 ```
+
+`--model` accepts a Hub ID or a complete local Sentence Transformers checkpoint
+(`final/` or `checkpoint-N/`, containing `modules.json`). Local model assets are
+loaded directly from disk; benchmark datasets may still require downloads.
+Raw SAE dictionaries and the parent training-output directory are not complete
+evaluation checkpoints.
+
+For a local model, `run_config.json` records the resolved path and a SHA256
+fingerprint of the inference files. Changed weights, tokenizer, configuration or
+custom code require a new evaluation output directory, preventing stale scores
+from being reused. Optimizer state and generated caches are excluded from this
+fingerprint. Keep evaluation output outside the checkpoint directory.
 
 The English workflows cover BEIR-15 and the retrieval tasks from
 `MTEB(eng, v2)` (10 tasks). The MTEB v2 suite preserves the benchmark's
@@ -184,7 +208,8 @@ BEIR reports average nDCG@10. The English MTEB v2 suite averages each task's
 nDCG@10 across its selected split/subset pairs, then averages tasks equally.
 This average describes the retrieval slice, not the full MTEB benchmark.
 
-Use `--revision` to pin a checkpoint. Lower `--batch-size` for encoder memory or
+Use `--revision` to pin a Hub checkpoint; omit it for local directories.
+Lower `--batch-size` for encoder memory or
 `--query-batch` / `--document-chunk` for scoring memory. Corpus vectors stay in
 host RAM. Use a separate output directory for each configuration.
 

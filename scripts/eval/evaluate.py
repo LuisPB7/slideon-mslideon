@@ -6,9 +6,11 @@
 # Here "no normalization" concerns final retrieval vectors; the SlideOn model
 # can still normalize token embeddings internally before its sparse head.
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 
 import numpy as np
 import torch
@@ -28,6 +30,60 @@ MTEB_SUITES = {
     "mteb-eng-v2": "MTEB(eng, v2)",
     "mteb-multilingual-v2": "MTEB(Multilingual, v2)",
 }
+
+
+def checkpoint_digest(directory):
+    """Fingerprint local inference files so replaced weights cannot reuse scores.
+
+    Include nested modules, tokenizer/config files, weight shards and custom
+    Python code. Optimizer state and generated caches are not used for inference
+    and can be much larger than the model, so exclude them from the hash.
+    """
+    ignored = {"optimizer.pt", "optimizer.bin", "scheduler.pt", "scaler.pt",
+               "training_args.bin", "trainer_state.json", "run_config.json", "README.md"}
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory)
+        if (not path.is_file() or any(part in {"__pycache__", ".git", ".cache"} for part in relative.parts)
+                or path.name in ignored or path.match("rng_state*.pth")
+                or path.suffix in {".pyc", ".pyo"}):
+            continue
+        # Delimit both filename and file length; neither timestamps nor the
+        # directory spelling determine the identity of the model's contents.
+        digest.update(relative.as_posix().encode("utf-8") + b"\0")
+        digest.update(str(path.stat().st_size).encode("ascii") + b"\0")
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def resolve_checkpoint(model, revision=None):
+    """Separate the model loading target from its stable MTEB cache identity."""
+    path = Path(model).expanduser()
+    if path.is_dir():
+        path = path.resolve()
+        if revision is not None:
+            raise ValueError("--revision applies only to Hugging Face models, not local checkpoints")
+        if not (path / "modules.json").is_file():
+            raise ValueError("Local checkpoint needs modules.json; pass a fine-tuning final/ or checkpoint-N/ directory")
+        # MTEB expects an owner/name identifier. Do not use an absolute path as
+        # its model name, or pass our synthetic revision to SparseEncoder.
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", path.name) or "checkpoint"
+        location = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:12]
+        return dict(model=str(path), model_id=f"local/{name}-{location}",
+                    revision="sha256-" + checkpoint_digest(path), local=True,
+                    load_kwargs={"local_files_only": True})
+    if path.exists():
+        raise ValueError("--model must point to a checkpoint directory, not an individual file")
+    if str(model).startswith((".", "~", os.sep)) or len(path.parts) > 2:
+        raise FileNotFoundError(f"Local checkpoint directory does not exist: {path}")
+
+    # Preserve the released-model workflow and its existing result-cache keys.
+    from huggingface_hub import HfApi
+    commit = HfApi().model_info(model, revision=revision).sha
+    return dict(model=model, model_id=model, revision=commit, local=False,
+                load_kwargs={"revision": commit})
 
 
 def write_json(path, value):
@@ -285,13 +341,13 @@ def summarize(results, tasks, suite_members):
                             for name, task in by_name.items()})
 
 
-def main():
+def main(argv=None):
     # 1. Read the evaluation request. Task lists and suites are mutually
     # exclusive; omitting both selects BEIR. Encoding and scoring chunk sizes
     # are separate because they constrain different intermediate allocations.
-    parser = argparse.ArgumentParser(description="Evaluate an HF sparse checkpoint with exact dot search")
-    parser.add_argument("--model", required=True, help="Hugging Face model ID")
-    parser.add_argument("--revision", help="Optional HF commit/tag; resolved commit is recorded")
+    parser = argparse.ArgumentParser(description="Evaluate a Hub or local sparse checkpoint with exact dot search")
+    parser.add_argument("--model", required=True, help="Hugging Face model ID or local final/checkpoint directory")
+    parser.add_argument("--revision", help="Hub models only: optional commit/tag; resolved commit is recorded")
     parser.add_argument("--trust-remote-code", action="store_true", help="Allow the checkpoint's custom ST adapter")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--suite", choices=list(SUITES) + list(MTEB_SUITES), nargs="+",
@@ -306,7 +362,7 @@ def main():
     parser.add_argument("--query-batch", type=int, default=64, help="Scoring query block size")
     parser.add_argument("--document-chunk", type=int, default=16384, help="Scoring document block size")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     # This evaluator is a single process. Unlike training, torchrun would start
     # duplicate evaluations sharing the output directory rather than shard work.
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
@@ -316,9 +372,13 @@ def main():
     ):
         parser.error("Invalid batch size or pruning budget")
     import mteb
-    from huggingface_hub import HfApi
     from mteb.cache import ResultCache
     from sentence_transformers import SparseEncoder
+
+    checkpoint = resolve_checkpoint(args.model, args.revision)
+    output = Path(args.output)
+    if checkpoint["local"] and output.resolve().is_relative_to(Path(checkpoint["model"])):
+        raise ValueError("Keep evaluation output outside the local checkpoint directory")
 
     # 2. Resolve the exact task scope before constructing the encoder. Explicit
     # --tasks produces per-task summaries without inventing a suite membership.
@@ -328,15 +388,15 @@ def main():
     else:
         tasks, suite_members = select_suites(suites, args.subsets, args.splits)
 
-    # Resolve a branch/tag/default revision to its immutable Hub commit and use
-    # that same commit for model loading and provenance. This CLI therefore
-    # expects a Hub model ID rather than an arbitrary local checkpoint path.
-    revision = HfApi().model_info(args.model, revision=args.revision).sha
-    config = dict(model=args.model, revision=revision, mteb_version=mteb.__version__, score="dot",
+    # Hub revisions are immutable commits; local revisions are hashes of the
+    # actual inference files. Retain the Hub config schema for existing runs.
+    revision = checkpoint["revision"]
+    config = dict(model=checkpoint["model"], revision=revision, mteb_version=mteb.__version__, score="dot",
                   suites=suite_members,
                   query_max_active_dims=args.query_max_active_dims, document_max_active_dims=args.document_max_active_dims, batch_size=args.batch_size,
                   tasks={t.metadata.name: dict(splits=list(t.metadata.eval_splits), subsets=list(t.hf_subsets)) for t in tasks})
-    output = Path(args.output)
+    if checkpoint["local"]:
+        config.update(checkpoint_source="local", mteb_model_id=checkpoint["model_id"])
     output.mkdir(parents=True, exist_ok=True)
     config_path = output / "run_config.json"
     # Reusing a directory is allowed only with the same recorded configuration.
@@ -350,9 +410,10 @@ def main():
     # 3. Load the checkpoint's Sentence Transformers adapter and switch it to
     # inference behavior. The model handles text->vector conversion; the wrapper
     # below handles corpus storage and exact dot-product ranking.
-    model = SparseEncoder(args.model, revision=revision, trust_remote_code=args.trust_remote_code, device=args.device)
+    model = SparseEncoder(checkpoint["model"], **checkpoint["load_kwargs"],
+                          trust_remote_code=args.trust_remote_code, device=args.device)
     model.eval()
-    search = ExactRetrieval(model, args.model, revision, output, args.batch_size, args.query_max_active_dims,
+    search = ExactRetrieval(model, checkpoint["model_id"], revision, output, args.batch_size, args.query_max_active_dims,
                             args.document_max_active_dims, args.query_batch, args.document_chunk)
     cache = ResultCache(output / "mteb")
     results = []

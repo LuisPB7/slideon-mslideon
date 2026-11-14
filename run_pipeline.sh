@@ -66,4 +66,4 @@ EVAL_TAG="${EVAL_SUITE}-q${QUERY_MAX_ACTIVE_DIMS}-d${DOCUMENT_MAX_ACTIVE_DIMS}"
     --query-max-active-dims "$QUERY_MAX_ACTIVE_DIMS" \
     --document-max-active-dims "$DOCUMENT_MAX_ACTIVE_DIMS" \
     --output "results/released-slideon-$EVAL_TAG"
-# Local final/ evaluation also needs Python support: the current CLI is Hub-only.
+# For our fine-tuned model, use --model "$SFT_OUTPUT/final" and omit --revision.
