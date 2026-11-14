@@ -270,6 +270,12 @@ def parse_args(argv=None):
         parser.add_argument("--" + key.replace("_", "-"), type=int, nargs="+")
     for key in ("bf16", "gradient_checkpointing"):
         parser.add_argument("--" + key.replace("_", "-"), action=argparse.BooleanOptionalAction)
+    # Optional data policies. None means use the original Trainer/collator path;
+    # the existing JSON config intentionally does not enable either option.
+    parser.add_argument("--source-sampling-alpha", type=float, default=None,
+                        help="Sample source-homogeneous batches with P(source) proportional to size**alpha")
+    parser.add_argument("--sample-negatives", type=int, default=None,
+                        help="Sample this many stored negatives per example during training")
     args = parse_config_args(parser, "retrieval", argv)
 
     # Validate the merged JSON + CLI result before loading models or datasets.
@@ -289,6 +295,10 @@ def parse_args(argv=None):
             raise ValueError("Batch sizes, lengths, step intervals, rates, and temperatures must be positive")
         if args.max_steps is None or args.max_steps == 0 or args.max_steps < -1:
             raise ValueError("max_steps must be -1 or a positive integer")
+        if args.source_sampling_alpha is not None and args.source_sampling_alpha < 0:
+            raise ValueError("source_sampling_alpha must be nonnegative")
+        if args.sample_negatives is not None and args.sample_negatives < 1:
+            raise ValueError("sample_negatives must be a positive integer")
         for key in ("kd_weight", "balance_weight", "query_flops", "document_flops", "weight_decay",
                     "flops_ramp_steps", "seed", "max_grad_norm"):
             if getattr(args, key) is None or getattr(args, key) < 0:
@@ -359,6 +369,20 @@ def main(argv=None):
     if len(dataset) < args.batch_size * int(os.environ.get("WORLD_SIZE", "1")):
         raise ValueError("Dataset is smaller than one per-step batch; lower --batch-size")
 
+    collator = RetrievalCollator(model[0])
+    sampler_options, sampling_metadata, sampling_callbacks = {}, None, []
+    if args.source_sampling_alpha is not None or args.sample_negatives is not None:
+        # The opt-in wrapper preserves row occurrence IDs for reproducible
+        # negative selection, including when Trainer skips batches on resume.
+        # With neither flag, retain the original Dataset, collator and sampler.
+        from slideon.sampling import SamplingEpochCallback, configure_sampling
+        dataset, collator, sampler_factory, sampling_metadata = configure_sampling(
+            dataset, collator, batch_size=args.batch_size,
+            alpha=args.source_sampling_alpha, num_negatives=args.sample_negatives,
+            seed=args.seed, world_size=int(os.environ.get("WORLD_SIZE", "1")))
+        sampler_options["batch_sampler"] = sampler_factory
+        sampling_callbacks.append(SamplingEpochCallback())
+
     # 3. Attach the objective and hand optimizer/scheduler/precision concerns to
     # SparseEncoderTrainer. A positive max_steps takes precedence over epochs
     # in Trainer's stopping rule. No backbone freeze is applied in this script.
@@ -378,16 +402,17 @@ def main(argv=None):
         max_grad_norm=args.max_grad_norm, gradient_checkpointing=False,
         save_steps=args.save_steps, logging_steps=args.logging_steps, save_total_limit=args.save_total_limit,
         report_to="none", remove_unused_columns=False, dataloader_drop_last=True, seed=args.seed,
-        ddp_find_unused_parameters=False)
+        ddp_find_unused_parameters=False, **sampler_options)
     trainer = SparseEncoderTrainer(model=model, args=training_args, train_dataset=dataset,
-        loss=loss, data_collator=RetrievalCollator(model[0]), callbacks=[RampCallback(loss)])
+        loss=loss, data_collator=collator, callbacks=[RampCallback(loss), *sampling_callbacks])
 
     # Only the main distributed process writes this shared provenance record.
     if trainer.is_world_process_zero():
         Path(args.output).mkdir(parents=True, exist_ok=True)
         write_run_config(args.output, run_config(args.model, "retrieval", args,
             world_size=training_args.world_size, dataset_fingerprint=dataset._fingerprint,
-            sae_commit=getattr(model[0].model.config, "_commit_hash", None)))
+            sae_commit=getattr(model[0].model.config, "_commit_hash", None),
+            sampling=sampling_metadata))
 
     # 4. Trainer executes forward/backward/update cycles and periodic checkpoint
     # saves. A successful run also writes final/; distributed cleanup runs even

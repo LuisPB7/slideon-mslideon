@@ -87,6 +87,57 @@ The script starts from the pinned SAE release. Pass `--sae outputs/slideon-sae/f
 to use your own pretrained SAE. Use `torchrun` for multiple GPUs and `--resume PATH`
 for a Trainer checkpoint. The completed model is saved under `final/`.
 
+To prepare the authors' English data and enable source/negative sampling, run:
+
+```bash
+bash run_finetune.sh
+```
+
+The launcher creates `english.jsonl` if it is missing, then fine-tunes from the
+released SAE using `--source-sampling-alpha 0.5 --sample-negatives 7`. It retains
+the existing training configuration and writes to `outputs/slideon-alpha05-neg7`.
+Set `PYTHON`, `TRAIN_JSONL`, `SFT_OUTPUT`, or `CUDA_VISIBLE_DEVICES` in the shell to
+override those launcher settings. Additional arguments go to the training script,
+for example `bash run_finetune.sh --resume outputs/slideon-alpha05-neg7/checkpoint-500`.
+
+The converter can also be run separately:
+
+```bash
+python scripts/finetune/preprocess.py \
+  --dataset lightonai/embeddings-fine-tuning-filtered-en \
+  --revision 3464b0de66da5834f165a7eded49f1cc63d0b5eb --output english.jsonl
+```
+
+Each row retains its `source`, query, positive, all ten negatives and eleven raw
+cross-encoder teacher scores. A sidecar manifest records the dataset revision,
+row counts and checksum. Existing output files are never overwritten. Regenerate
+older JSONL exports lacking `source` labels before enabling source sampling.
+
+Both training flags are optional and independent:
+
+| Flag | When enabled | When omitted |
+| --- | --- | --- |
+| `--source-sampling-alpha 0.5` | Draw each batch from one source, with probability proportional to that source's row count raised to alpha | Original Trainer sampling |
+| `--sample-negatives 7` | Select seven stored negatives per example exposure, keeping teacher scores aligned | Use all negatives supplied by the input file |
+
+Thus the original invocation above preserves the original training behavior;
+with the new JSONL it consumes ten negatives. Alpha zero means uniform sampling
+across sources, not disabled sampling. Each source batch contains distinct rows;
+rows can recur in later batches. Every source must contain at least `batch_size`
+rows. One sampled epoch draws approximately the input row count, rounded down to
+complete batches on all processes, rather than guaranteeing a visit to every row.
+Sampling probabilities and epoch size are recorded in `run_config.json`.
+
+Keep sampling settings, seed, data, batch size and distributed world size fixed
+when resuming a run. Source draws and negative subsets are deterministic from
+the epoch and draw position, so worker prefetch does not change replay.
+
+Run the CPU-only sampling and Trainer checkpoint tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 The script exposes contrastive and distillation losses, load balancing, FLOPS
 penalties, and Matryoshka query/document budgets. For example:
 
@@ -103,9 +154,11 @@ does not enlarge the negative pool. A positive `max_steps` takes precedence over
 `epochs` (use `--max-steps -1` for epoch-based retrieval training).
 
 The configs combine recorded checkpoint settings with explicit defaults for these
-standalone scripts. Data mixing and filtering for retrieval fine-tuning remain
-upstream responsibilities, and some historical dataset revisions are unavailable.
-Full reproduction of the released metrics has not been established.
+standalone scripts. Optional data sampling reconstructs the reported source and
+negative sampling policies; the authors' exact historical loader is unavailable.
+In particular, accumulation still does not enlarge the contrastive negative pool.
+Some historical dataset revisions are unavailable, and full reproduction of the
+released metrics has not been established.
 
 ## Evaluation
 
