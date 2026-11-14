@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run with: bash run_eval.sh
 # One-time setup in your Python environment: pip install -e '.[eval]'
-# Edit the settings below, or override them through environment variables.
+# Edit the settings below, save this file, then run: bash run_eval.sh
+# These values are fixed for each run; environment variables do not override them.
 set -euo pipefail
 
 # MODEL: the same command evaluates SAE and fine-tuned weights.
@@ -10,30 +11,31 @@ set -euo pipefail
 # Our raw SAE:        outputs/slideon-sae/final
 # Our fine-tune:      outputs/slideon-alpha05-neg7/final
 # Relative paths are resolved from this repository; absolute paths work too.
-MODEL_ID_OR_PATH="${MODEL_ID_OR_PATH:-lightonai/SlideOn}"
+MODEL_ID_OR_PATH="lightonai/SlideOn"
 # "auto" uses our existing pins for the two released models; local paths have
 # no Hub revision. Set a Hub commit explicitly, or "" to resolve its latest.
-MODEL_REVISION="${MODEL_REVISION-auto}"
+MODEL_REVISION="auto"
 
 # TOKEN LIMITS: "" preserves the checkpoint's saved limit for that role.
 # Set either independently, e.g. QUERY_LENGTH=128 and DOCUMENT_LENGTH=512.
-QUERY_LENGTH="${QUERY_LENGTH-}"
-DOCUMENT_LENGTH="${DOCUMENT_LENGTH-}"
+QUERY_LENGTH=""
+DOCUMENT_LENGTH=""
 
 # BENCHMARK: "beir" (15 datasets) or "BEIR-Small" (9 datasets), for example.
-EVAL_SUITE="${EVAL_SUITE:-beir}"
+EVAL_SUITE="beir"
 # Final-vector sparsity, separate from token limits. "" means unpruned.
-QUERY_MAX_ACTIVE_DIMS="${QUERY_MAX_ACTIVE_DIMS-64}"
-DOCUMENT_MAX_ACTIVE_DIMS="${DOCUMENT_MAX_ACTIVE_DIMS-512}"
-BATCH_SIZE="${BATCH_SIZE:-8}"  # Number of texts encoded together.
+QUERY_MAX_ACTIVE_DIMS=64
+DOCUMENT_MAX_ACTIVE_DIMS=512
+BATCH_SIZE=8  # Number of texts encoded together.
 
 # RESULTS: set a directory, or leave "" to name it from the settings below.
 # Use a separate directory for each checkpoint/settings combination.
-EVAL_OUTPUT="${EVAL_OUTPUT-}"
-PYTHON="${PYTHON:-python3}"
+EVAL_OUTPUT=""
+PYTHON="python3"
 # Evaluation uses one process and the first visible GPU; "" selects CPU only.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0}"
+export CUDA_VISIBLE_DEVICES="0"
 
+# Settings end here. The rest builds and runs the evaluation command.
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
@@ -61,4 +63,4 @@ ARGS=(--model "$MODEL_ID_OR_PATH" --trust-remote-code --suite "$EVAL_SUITE"
 [[ -z "$DOCUMENT_LENGTH" ]] || ARGS+=(--document-length "$DOCUMENT_LENGTH")
 [[ -z "$QUERY_MAX_ACTIVE_DIMS" ]] || ARGS+=(--query-max-active-dims "$QUERY_MAX_ACTIVE_DIMS")
 [[ -z "$DOCUMENT_MAX_ACTIVE_DIMS" ]] || ARGS+=(--document-max-active-dims "$DOCUMENT_MAX_ACTIVE_DIMS")
-exec "$PYTHON" scripts/eval/evaluate.py "${ARGS[@]}" "$@"
+exec "$PYTHON" scripts/eval/evaluate.py "${ARGS[@]}"

@@ -87,7 +87,16 @@ The script starts from the pinned SAE release. Pass `--sae outputs/slideon-sae/f
 to use your own pretrained SAE. Use `torchrun` for multiple GPUs and `--resume PATH`
 for a Trainer checkpoint. The completed model is saved under `final/`.
 
-To prepare the authors' English data, fine-tune and evaluate the local result, run:
+To prepare the authors' English data, fine-tune and evaluate the local result,
+edit the constants at the top of `run_finetune.sh`, then run the script. For example:
+
+```bash
+# Edit these lines inside run_finetune.sh:
+export CUDA_VISIBLE_DEVICES="0,1"
+BATCH_SIZE=4
+GLOBAL_BATCH_SIZE=128
+RESUME_CHECKPOINT=""  # Or a saved checkpoint-N directory.
+```
 
 ```bash
 pip install -e '.[eval]'
@@ -95,16 +104,19 @@ bash run_finetune.sh
 ```
 
 The launcher creates `english.jsonl` if it is missing, then fine-tunes from the
-released SAE using `--source-sampling-alpha 0.5 --sample-negatives 7`. It retains
-the existing training configuration and writes to `outputs/slideon-alpha05-neg7`.
+released SAE with `SOURCE_SAMPLING_ALPHA=0.5` and `SAMPLE_NEGATIVES=7`; an empty
+value disables either option independently. Set GPU selection, paths, checkpoint
+pins, batch sizes, token limits and training settings in the same configuration
+block. Multiple selected GPUs automatically use `torchrun`, and accumulation is
+derived from the global batch size. Remaining loss and optimizer settings stay
+in `TRAIN_CONFIG`. The default output is `outputs/slideon-alpha05-neg7`.
+
 After successful training, it evaluates that directory's `final/` model on BEIR-15
-with 64 query / 512 document active dimensions. Evaluation results go to
-`outputs/slideon-alpha05-neg7/beir-q64-d512`, including `summary.json`.
-Set `PYTHON`, `TRAIN_JSONL`, `SFT_OUTPUT`, `EVAL_OUTPUT`, or `CUDA_VISIBLE_DEVICES`
-in the shell to override launcher settings. Use `SFT_OUTPUT` rather than forwarding
-`--output`, so training and evaluation always refer to the same run.
-Additional arguments go to the training script,
-for example `bash run_finetune.sh --resume outputs/slideon-alpha05-neg7/checkpoint-500`.
+with 64 query / 512 document active dimensions and encoder batch size 8. Empty
+`EVAL_QUERY_LENGTH` and `EVAL_DOCUMENT_LENGTH` preserve the checkpoint's saved
+limits; empty `EVAL_OUTPUT` derives the results directory automatically.
+Set `PREPARE_DATA_IF_MISSING=false` to require existing training data, or
+`RUN_EVALUATION=false` to stop after training.
 
 The converter can also be run separately:
 
@@ -168,21 +180,28 @@ released metrics has not been established.
 
 ## Evaluation
 
-`run_eval.sh` evaluates one checkpoint per run. Edit its settings at the top, or
-override them with environment variables:
+`run_eval.sh` evaluates one checkpoint per run. Open the file and edit the
+assignments at the top. For example, to evaluate our fine-tuned model with
+128-token limits on BEIR-Small, replace the corresponding lines with:
+
+```bash
+MODEL_ID_OR_PATH="outputs/slideon-alpha05-neg7/final"
+EVAL_SUITE="BEIR-Small"
+QUERY_LENGTH=128
+DOCUMENT_LENGTH=128
+EVAL_OUTPUT="results/our-finetune-small-128"
+```
+
+Save the file, then run this command from the repository directory:
 
 ```bash
 bash run_eval.sh
-
-MODEL_ID_OR_PATH=outputs/slideon-alpha05-neg7/final \
-  EVAL_SUITE=BEIR-Small QUERY_LENGTH=128 DOCUMENT_LENGTH=128 \
-  EVAL_OUTPUT=results/our-finetune-small-128 bash run_eval.sh
 ```
 
 The default evaluates the released fine-tuned `lightonai/SlideOn` on BEIR with
 64 query / 512 document active dimensions. `QUERY_LENGTH` and `DOCUMENT_LENGTH`
 default to empty strings, preserving each checkpoint's saved token limit;
-either can be overridden independently. `BATCH_SIZE` defaults to 8. An empty
+either can be set independently. `BATCH_SIZE` defaults to 8. An empty
 `EVAL_OUTPUT` generates a directory under `results/` named from the model, suite,
 token limits and sparsity settings.
 
