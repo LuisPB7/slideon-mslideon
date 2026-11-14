@@ -26,8 +26,12 @@ RELEASED_SLIDEON_REVISION="370c600e9886afc43ff8026695261e56ecfaa011"
 # Default English benchmark; use a different output directory for each setting.
 EVAL_SUITE="beir"
 # EVAL_SUITE="mteb-eng-v2"
-# Evaluation preserves saved sparsity settings (unpruned for these releases),
-# token_k, prompts and sequence lengths, plus the evaluator's batch/chunk defaults.
+QUERY_MAX_ACTIVE_DIMS=64
+DOCUMENT_MAX_ACTIVE_DIMS=512
+EVAL_TAG="${EVAL_SUITE}-q${QUERY_MAX_ACTIVE_DIMS}-d${DOCUMENT_MAX_ACTIVE_DIMS}"
+# Cap the final pooled vectors at 64 query / 512 document nonzeros. A vector
+# with fewer positive features remains smaller. Per-token token_k, prompts,
+# sequence lengths and the evaluator's batch/chunk defaults stay unchanged.
 
 
 # 1. PRE-TRAIN: prepare the frozen DenseOn token cache (disabled).
@@ -42,7 +46,9 @@ EVAL_SUITE="beir"
 "$PYTHON" scripts/eval/evaluate.py \
     --model "$RELEASED_SAE" --revision "$RELEASED_SAE_REVISION" \
     --trust-remote-code --suite "$EVAL_SUITE" \
-    --output "results/released-sae-$EVAL_SUITE"
+    --query-max-active-dims "$QUERY_MAX_ACTIVE_DIMS" \
+    --document-max-active-dims "$DOCUMENT_MAX_ACTIVE_DIMS" \
+    --output "results/released-sae-$EVAL_TAG"
 # Local raw-SAE evaluation needs loader support in the Python evaluator first.
 
 # 4. FINE-TUNE: start from the config's pinned released SAE (disabled).
@@ -57,5 +63,7 @@ EVAL_SUITE="beir"
 "$PYTHON" scripts/eval/evaluate.py \
     --model "$RELEASED_SLIDEON" --revision "$RELEASED_SLIDEON_REVISION" \
     --trust-remote-code --suite "$EVAL_SUITE" \
-    --output "results/released-slideon-$EVAL_SUITE"
+    --query-max-active-dims "$QUERY_MAX_ACTIVE_DIMS" \
+    --document-max-active-dims "$DOCUMENT_MAX_ACTIVE_DIMS" \
+    --output "results/released-slideon-$EVAL_TAG"
 # Local final/ evaluation also needs Python support: the current CLI is Hub-only.
