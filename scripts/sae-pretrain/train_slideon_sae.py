@@ -1,9 +1,10 @@
 """Pretrain SlideOn-SAE: frozen token preparation, model, loss, and training loop."""
 # Reading map: main() at the bottom chooses one of two independent stages.
 #   --prepare: dataset tables OR text JSONL -> frozen DenseOn tokens -> disk cache.
-#   training: disk cache -> shuffled token batches -> TopKSAE -> raw SAE checkpoint.
+#   --online: JSONL texts -> frozen DenseOn -> shuffled in-memory token batches.
+#   training: online batches OR disk cache -> TopKSAE -> raw SAE checkpoint.
 # Start with main(), then Recipe, then follow only the branch you intend to run.
-# DenseOn is never optimized here: the train() branch does not load it at all.
+# DenseOn is never optimized here; online training uses it only for inference.
 # Retrieval fine-tuning later consumes the raw SAE directory saved by this script.
 import argparse
 import json
@@ -26,6 +27,7 @@ from transformers import AutoModel, AutoTokenizer
 from slideon.modeling_slideon import TokenProjection
 from slideon.models import SlideOn
 from slideon.sae_texts import prepare_jsonl_cache
+from slideon.sae_online import OnlineTokenSource
 
 
 # Recipe is the experiment contract shared by preparation, training, and export.
@@ -299,7 +301,7 @@ def cache_recipe(config, input_mode="hf"):
     return json.loads(json.dumps({key: config.get(key) for key in keys}))
 
 
-# FrozenTokens is the preparation-time encoder, not the autoencoder being trained.
+# FrozenTokens provides preparation-time or online frozen token embeddings.
 # It reuses the retrieval adapter's text preprocessing so prompt and marker rules
 # agree, but returns unpooled per-token vectors instead of sequence-level features.
 class FrozenTokens(torch.nn.Module):
@@ -308,9 +310,13 @@ class FrozenTokens(torch.nn.Module):
 
     # Load the exact backbone snapshot and configure preprocessing from its metadata.
     # English needs only the Transformer; any dense sequence-pooling layer is omitted.
-    def __init__(self, recipe, device):
+    def __init__(self, recipe, device, load_encoder=True):
         super().__init__()
-        root = Path(snapshot_download(recipe.base_model, revision=recipe.base_model_revision))
+        download_kwargs = {} if load_encoder else dict(allow_patterns=[
+            "config.json", "config_sentence_transformers.json", "tokenizer*",
+            "special_tokens_map.json", "added_tokens.json", "vocab.*", "merges.txt", "*.model",
+        ])
+        root = Path(snapshot_download(recipe.base_model, revision=recipe.base_model_revision, **download_kwargs))
         self.encoder_config = json.loads((root / "config_sentence_transformers.json").read_text())
         # Clear late-interaction marker/skip-list behavior for the dense English
         # backbone. Ordinary textual query/document prompts still come from Recipe.
@@ -326,6 +332,10 @@ class FrozenTokens(torch.nn.Module):
             self.tokenizer.pad_token_id = self.tokenizer.mask_token_id
         elif self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        # The optional indexing-only stage needs prompts/tokenization, not model
+        # weights or CUDA. It runs before multi-GPU workers join their process group.
+        if not load_encoder:
+            return
         # BF16 applies on CUDA when requested; CPU extraction uses FP32. The
         # separate FP16 disk representation is chosen by encode() after normalization.
         self.encoder = AutoModel.from_pretrained(root, dtype=torch.bfloat16 if recipe.bf16 and device.type == "cuda" else torch.float32)
@@ -343,13 +353,48 @@ class FrozenTokens(torch.nn.Module):
         # cache construction cannot accumulate backbone gradients.
         self.to(device).eval().requires_grad_(False)
 
-    # Encode a list of query OR document strings into variable-length arrays.
-    # Each returned array has shape [valid_sequence_tokens, d_model]; the caller
-    # concatenates arrays on disk and records offsets to recover their boundaries.
-    @torch.inference_mode()
-    def encode(self, texts, task):
-        features = self.preprocess(texts, task=task)
-        features = {k: v.to(self.encoder.device) for k, v in features.items() if isinstance(v, torch.Tensor)}
+    def _record_features(self, records):
+        """Apply role-specific prompts/limits, then pad ONE mixed-role batch."""
+        groups = []
+        for role in ("query", "document"):
+            indices = [i for i, record in enumerate(records) if record.get("role", "document") == role]
+            if indices:
+                features = self.preprocess([records[i]["text"] for i in indices], task=role)
+                groups.append((indices, {k: v for k, v in features.items() if isinstance(v, torch.Tensor)}))
+        if sum(len(indices) for indices, _ in groups) != len(records) or not groups:
+            raise ValueError("Expected a nonempty batch of query/document records")
+        width = max(features["input_ids"].shape[1] for _, features in groups)
+        batch = {}
+        for indices, features in groups:
+            length = features["input_ids"].shape[1]
+            start = width - length if self.tokenizer.padding_side == "left" else 0
+            for key, value in features.items():
+                if key not in batch:
+                    fill = self.tokenizer.pad_token_id if key == "input_ids" else 0
+                    batch[key] = torch.full((len(records), width), fill, dtype=value.dtype)
+                batch[key][indices, start:start+length] = value
+        return batch
+
+    def _retained_mask(self, features, records):
+        mask = features["attention_mask"].bool()
+        if self.encoder_config.get("skiplist_words"):
+            skip = torch.tensor(self.tokenizer.convert_tokens_to_ids(self.encoder_config["skiplist_words"]),
+                                device=mask.device)
+            documents = torch.tensor([record.get("role", "document") == "document" for record in records],
+                                     device=mask.device).unsqueeze(1)
+            mask &= ~(documents & torch.isin(features["input_ids"], skip))
+        return mask
+
+    def count_tokens(self, records):
+        """Indexing counts retained tokens on CPU, without a DenseOn forward."""
+        features = self._record_features(records)
+        return self._retained_mask(features, records).sum(1).tolist()
+
+    @torch.no_grad()
+    def encode_records(self, records):
+        # no_grad produces ordinary tensors that SAE backward may save for its
+        # weight gradients. inference_mode tensors would require an extra clone.
+        features = {k: v.to(self.encoder.device) for k, v in self._record_features(records).items()}
         # Contextualization sees the complete padded sequence; selection happens
         # afterward, retaining special/prompt tokens but excluding masked padding.
         tokens = self.encoder(**features).last_hidden_state
@@ -358,13 +403,16 @@ class FrozenTokens(torch.nn.Module):
         # Normalization makes the SAE learn directions in the backbone token space.
         # It is per token, never pooling or normalizing an entire sequence vector.
         tokens = torch.nn.functional.normalize(tokens, dim=-1)
-        mask = features["attention_mask"].bool()
-        if task == "document" and self.encoder_config.get("skiplist_words"):
-            skip = torch.tensor(self.tokenizer.convert_tokens_to_ids(self.encoder_config["skiplist_words"]), device=tokens.device)
-            mask &= ~torch.isin(features["input_ids"], skip)
-        # Transfer only retained vectors to host memory, explicitly as two-byte
-        # floats, so the cache writer can store compact contiguous numeric bytes.
-        return [row[keep].half().cpu().numpy() for row, keep in zip(tokens, mask)]
+        mask = self._retained_mask(features, records)
+        # Preserve the offline cache's FP16 rounding, but keep online vectors on
+        # the encoder device. Padding never becomes an SAE training example.
+        return [row[keep].half() for row, keep in zip(tokens, mask)]
+
+    @torch.inference_mode()
+    def encode(self, texts, task):
+        """Compatibility adapter for the original disk-cache preparation path."""
+        records = [{"text": text, "role": task} for text in texts]
+        return [array.cpu().numpy() for array in self.encode_records(records)]
 
 
 # Map a split to its Hugging Face dataset repository. All English splits come
@@ -674,11 +722,12 @@ class TokenBatches:
         return self.buffer[self.permutation[start:start+self.batch_size]].float()
 
 
-# Main optimization stage. It reads only the numeric cache, trains TopKSAE, and
-# writes raw SAE parameters plus restart state. It does not instantiate DenseOn.
+# Main optimization stage. Both online and cached providers yield the same
+# fixed-size token tensors. Only TopKSAE belongs to the optimizer or DDP wrapper.
 # torchrun supplies rank/world environment values; a plain python run uses one rank.
 def train(recipe, cache_path, output, *, resume=None, stop_after=None, save_steps=100000,
-          log_steps=100, buffer_tokens=4_000_000, run_settings=None, dataset_revisions=None):
+          log_steps=100, buffer_tokens=4_000_000, run_settings=None, dataset_revisions=None,
+          online=False, texts_jsonl=None, index_dir=None, encode_batch_size=4):
     # Bind each worker to its local device and initialize distributed communication
     # before any cross-rank dictionary, gradient, or metric synchronization.
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -695,24 +744,6 @@ def train(recipe, cache_path, output, *, resume=None, stop_after=None, save_step
     if recipe.batch_size % world:
         raise ValueError("The global token batch must be divisible by world size")
     torch.manual_seed(recipe.seed)
-    # Loading validates prepared files; explicit dataset pins must also match the
-    # recorded manifest so training cannot silently switch its cached corpus.
-    cache = TokenCache(cache_path, recipe)
-    for repo, revision in (dataset_revisions or {}).items():
-        if cache.manifest["dataset_revisions"].get(repo) != revision:
-            raise ValueError(f"Token-cache revision does not match the configuration: {repo}")
-    if int(cache.ends[-1]) < world:
-        raise ValueError("At least one cached document per rank is required")
-
-    # Derive an optimizer-update budget from the historical raw-token count.
-    # This is floor(fraction * scheduled_tokens / global_batch) * epochs; it is not
-    # a count of complete traversals through the prompted token buffers.
-    # max_steps caps the full schedule, whereas stop_after below only pauses it.
-    steps = int(cache.scheduled_tokens * recipe.schedule_token_fraction) // recipe.batch_size * recipe.epochs
-    if recipe.max_steps:
-        steps = min(steps, recipe.max_steps)
-    if steps < 1:
-        raise ValueError("Cache is smaller than one global batch")
     # Fresh runs require an empty destination; resuming is the explicit operation
     # that permits continued writes into an existing experiment directory.
     output = Path(output)
@@ -722,6 +753,30 @@ def train(recipe, cache_path, output, *, resume=None, stop_after=None, save_step
         dist.barrier()
     output.mkdir(parents=True, exist_ok=True)
 
+    if online:
+        if not texts_jsonl or not index_dir or dataset_revisions:
+            raise ValueError("Online training requires texts_jsonl/index_dir and no HF dataset revision pins")
+        encoder = FrozenTokens(recipe, device)
+        cache = OnlineTokenSource(recipe, texts_jsonl, index_dir, encoder, encode_batch_size, device,
+                                  rank=rank, world=world)
+        # True text epochs: each retained token appears once per epoch. Carry
+        # leftovers across epoch boundaries; discard only the final incomplete batch.
+        steps = cache.steps
+    else:
+        cache = TokenCache(cache_path, recipe)
+        for repo, revision in (dataset_revisions or {}).items():
+            if cache.manifest["dataset_revisions"].get(repo) != revision:
+                raise ValueError(f"Token-cache revision does not match the configuration: {repo}")
+        if int(cache.ends[-1]) < world:
+            raise ValueError("At least one cached document per rank is required")
+        # Preserve the original cached path's approximate raw-token schedule.
+        steps = int(cache.scheduled_tokens * recipe.schedule_token_fraction) // recipe.batch_size * recipe.epochs
+    if recipe.max_steps:
+        steps = min(steps, recipe.max_steps)
+    if steps < 1:
+        raise ValueError("Training data is smaller than one global token batch")
+    manifest_key = "input_manifest" if online else "cache_manifest"
+
     # Initialize from data only on rank zero. DDP construction then broadcasts the
     # same initial parameter state to every worker before training starts.
     model = TopKSAE(recipe).to(device)
@@ -729,9 +784,11 @@ def train(recipe, cache_path, output, *, resume=None, stop_after=None, save_step
     # Optimizer/data trajectories depend on these settings, so resume requires
     # the same recipe, cache, number of ranks and approximate buffer target.
     if state:
-        if (state["recipe"] != recipe.checkpoint_config() or state["cache_manifest"] != cache.manifest
-                or state["world_size"] != world or state["buffer_tokens"] != buffer_tokens):
-            raise ValueError("Resume requires the same recipe, token cache, buffer size, and world size")
+        if (state["recipe"] != recipe.checkpoint_config() or state.get(manifest_key) != cache.manifest
+                or state["world_size"] != world or
+                (state.get("encode_batch_size") != encode_batch_size if online else
+                 state.get("buffer_tokens") != buffer_tokens)):
+            raise ValueError("Resume requires the same recipe, input data, batching settings, and world size")
         model.load_state_dict(state["model"])
     elif rank == 0:
         rng = random.Random(recipe.seed)
@@ -739,8 +796,9 @@ def train(recipe, cache_path, output, *, resume=None, stop_after=None, save_step
     wrapped = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank] if device.type == "cuda" else None) if world > 1 else model
     # Restore each rank's own sequence/buffer cursor when resuming. Fresh runs
     # consume one pending batch to initialize the learned centering bias.
-    batches = TokenBatches(cache, recipe, rank, world, device, buffer_tokens,
-                          state["data_states"][rank] if state else None)
+    data_state = state["data_states"][rank] if state else None
+    batches = (cache.batches(state=data_state) if online else
+               TokenBatches(cache, recipe, rank, world, device, buffer_tokens, data_state))
     pending = None
     if state is None:
         # Keep this first batch as pending so initialization does not discard it.
@@ -772,13 +830,20 @@ def train(recipe, cache_path, output, *, resume=None, stop_after=None, save_step
     if rank == 0:
         settings = dict(run_settings or {key: getattr(recipe, key) for key in RECIPE_KEYS})
         settings.setdefault("encode_batch_size", 4)
-        settings.update(cache=str(cache_path), output=str(output), resume=str(resume) if resume else None,
-                        prepare=False, stop_after=stop_after, save_steps=save_steps, log_steps=log_steps,
-                        buffer_tokens=buffer_tokens, dataset_revisions=cache.manifest["dataset_revisions"])
+        settings.update(output=str(output), resume=str(resume) if resume else None,
+                        prepare=False, stop_after=stop_after, save_steps=save_steps, log_steps=log_steps)
+        if online:
+            settings.update(online=True, texts_jsonl=[str(path) for path in texts_jsonl],
+                            index_dir=str(index_dir), encode_batch_size=encode_batch_size)
+            for key in ("cache", "buffer_tokens", "dataset_revisions"):
+                settings.pop(key, None)
+        else:
+            settings.update(cache=str(cache_path), buffer_tokens=buffer_tokens,
+                            dataset_revisions=cache.manifest["dataset_revisions"])
         write_run_config(output, run_config(model_name(recipe.name), "sae", argparse.Namespace(**settings),
                                            world_size=world, scheduled_steps=steps))
         (output / "recipe.json").write_text(json.dumps(recipe.checkpoint_config(), indent=2))
-        (output / "cache_manifest.json").write_text(json.dumps(cache.manifest, indent=2))
+        (output / f"{manifest_key}.json").write_text(json.dumps(cache.manifest, indent=2))
         print(f"{recipe.name}: {steps:,} updates; global token batch {recipe.batch_size}; world size {world}", flush=True)
 
     # Nested helper closes over the live model, optimizer, scheduler and iterator.
@@ -802,8 +867,9 @@ def train(recipe, cache_path, output, *, resume=None, stop_after=None, save_step
             # training_state.pt additionally keeps Adam moments, LR state and all
             # rank cursors for exact continuation under the checked resume settings.
             checkpoint = dict(step=step, model=weights, optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(),
-                              data_states=data_states, recipe=recipe.checkpoint_config(), cache_manifest=cache.manifest,
-                              world_size=world, buffer_tokens=buffer_tokens)
+                              data_states=data_states, recipe=recipe.checkpoint_config(), world_size=world)
+            checkpoint[manifest_key] = cache.manifest
+            checkpoint["encode_batch_size" if online else "buffer_tokens"] = encode_batch_size if online else buffer_tokens
             # Rename the completed restart state atomically, avoiding a truncated
             # .pt file being mistaken for a usable checkpoint after interruption.
             temporary = folder / "training_state.pt.partial"
@@ -868,7 +934,13 @@ def train(recipe, cache_path, output, *, resume=None, stop_after=None, save_step
         # path; the final flag depends on finishing the full schedule, not this call.
         if (step + 1) % save_steps == 0 and step + 1 != end:
             save(step+1)
+    if online and end == cache.steps:
+        discarded = batches.finish()
+        if rank == 0:
+            print(f"Completed {recipe.epochs} text epochs; discarded {discarded} final leftover tokens", flush=True)
     save(end, final=end == steps)
+    if online:
+        cache.close()
 
 
 # Config loading is separate from argument parsing so --config can select an
@@ -956,8 +1028,13 @@ def parse_args(argv=None):
     parser.add_argument("--output", help="Training output directory")
     parser.add_argument("--prepare", action=argparse.BooleanOptionalAction, default=False,
                         help="Prepare tokens only, using one process")
+    parser.add_argument("--online", action=argparse.BooleanOptionalAction, default=False,
+                        help="Train directly from JSONL with frozen DenseOn; no embedding files")
+    parser.add_argument("--index-dir", help="Compact JSONL offsets/token-count index for online training")
+    parser.add_argument("--index-only", action="store_true",
+                        help="Build/validate the online text index on CPU, without loading DenseOn weights")
     parser.add_argument("--texts-jsonl", type=str, nargs="+",
-                        help="Prepare from text JSONL files instead of the original HF tables (requires --prepare)")
+                        help="Text JSONL files for --online training or --prepare offline caching")
     parser.add_argument("--encode-batch-size", type=int)
     parser.add_argument("--dataset-revisions", help="JSON file mapping dataset repositories to exact revisions")
     parser.add_argument("--resume", help="Path to a training_state.pt from this trainer")
@@ -987,15 +1064,20 @@ def parse_args(argv=None):
             for repo, revision in args.dataset_revisions.items()
         ):
             raise ValueError("dataset_revisions must map repository IDs to revision strings")
-        # --cache is common to both modes. Only training needs --output because
-        # preparation's deliverables live directly inside the cache directory.
-        if not args.cache:
-            raise ValueError("--cache is required")
-        if not args.prepare and not args.output:
+        if args.online:
+            if args.prepare or args.cache or not args.texts_jsonl or not args.index_dir:
+                raise ValueError("--online requires --texts-jsonl and --index-dir, without --prepare or --cache")
+        elif not args.cache:
+            raise ValueError("--cache is required for offline preparation/training")
+        elif args.index_dir:
+            raise ValueError("--index-dir requires --online")
+        if args.index_only and not args.online:
+            raise ValueError("--index-only requires --online")
+        if not args.prepare and not args.index_only and not args.output:
             raise ValueError("--output is required for training")
         if args.texts_jsonl is not None:
-            if not args.prepare or not args.texts_jsonl:
-                raise ValueError("--texts-jsonl requires --prepare and at least one input file")
+            if not (args.prepare or args.online) or not args.texts_jsonl:
+                raise ValueError("--texts-jsonl requires --prepare or --online and at least one input file")
             if args.dataset_revisions:
                 raise ValueError("dataset_revisions applies to HF tables, not --texts-jsonl input")
         if min(args.save_steps, args.log_steps, args.buffer_tokens, args.encode_batch_size) < 1:
@@ -1011,6 +1093,14 @@ def parse_args(argv=None):
 # or train() to understand optimization. The two modes deliberately do not overlap.
 def main(argv=None):
     args, recipe = parse_args(argv)
+    if args.index_only:
+        if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+            raise ValueError("Run --index-only once before launching distributed training")
+        encoder = FrozenTokens(recipe, torch.device("cpu"), load_encoder=False)
+        source = OnlineTokenSource(recipe, args.texts_jsonl, args.index_dir, encoder,
+                                   args.encode_batch_size, torch.device("cpu"))
+        source.close()
+        return
     # Preparation runs once in one process; torchrun is for consuming the finished
     # cache with distributed SAE training, not duplicating the frozen encoding work.
     if args.prepare:
@@ -1032,7 +1122,8 @@ def main(argv=None):
         train(recipe, args.cache, args.output, resume=args.resume, stop_after=args.stop_after,
               save_steps=args.save_steps, log_steps=args.log_steps, buffer_tokens=args.buffer_tokens,
               run_settings={key: value for key, value in vars(args).items() if key not in ("config", "model")},
-              dataset_revisions=args.dataset_revisions)
+              dataset_revisions=args.dataset_revisions, online=args.online, texts_jsonl=args.texts_jsonl,
+              index_dir=args.index_dir, encode_batch_size=args.encode_batch_size)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

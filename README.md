@@ -48,31 +48,21 @@ saves the effective settings in `run_config.json`. Use `--help` for available fl
 
 ### SAE pretraining
 
-Prepare frozen token embeddings once, then train the SAE:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/sae-pretrain/train_slideon_sae.py \
-  --prepare --cache token-cache/slideon
-
-torchrun --standalone --nproc_per_node=8 scripts/sae-pretrain/train_slideon_sae.py \
-  --cache token-cache/slideon --output outputs/slideon-sae
-```
+The launcher trains online: frozen DenseOn encodes batches of texts, and the SAE
+learns from their token vectors held temporarily in memory. It does not write a
+full embedding cache. Edit the constants at the top of `run_pretraining.sh`, then
+run `bash run_pretraining.sh`. Set `TEXTS_JSONL` to one or more local JSONL files,
+`INDEX_DIR` to the compact text index, and `SAE_OUTPUT` to a fresh output directory.
 
 The SAE config selects DenseOn and AuxK, with 32,768 latents, token top-k 32,
-a global token batch of 4,096, and AdamW at 0.0003. Change these and the data selection in the config. Token
-preparation records dataset revisions; `--dataset-revisions pins.json` accepts
-a mapping of dataset IDs to exact commits. The FP16 cache uses two bytes per
-token dimension, so check storage before preparing a full training corpus.
+a global token batch of 4,096, and AdamW at 0.0003. The launcher uses these SAE
+settings and three epochs, with **192-token query/document limits** and
+`ENCODE_BATCH_SIZE=512`. These 512 texts are one physical DenseOn batch per GPU;
+they are separate from the 4,096 token vectors used in each global SAE update.
+Reduce the encoding batch if GPU memory is insufficient. The launcher passes
+its editable settings as CLI arguments, overriding the corresponding JSON values.
 
-Training writes metrics to `metrics.jsonl` and the completed SAE to `final/`.
-Resume with `--resume path/to/training_state.pt`, keeping the same config, token
-cache, world size, and buffer size. `--stop-after N` allows an early stop without
-changing the learning-rate schedule.
-
-To pretrain from your own text collection, edit the constants at the top of
-`run_pretraining.sh`, then run `bash run_pretraining.sh`. Set `TEXTS_JSONL` to one
-or more local JSONL files, and choose `CACHE_DIR` and `SAE_OUTPUT`. Each line is
-an independent text, for example:
+Each JSONL line is an independent text, for example:
 
 ```json
 {"id":"p123","source":"msmarco_v1","role":"document","text":"A passage to encode."}
@@ -126,14 +116,74 @@ selection or deduplication. Queries and documents use their existing prompts and
 length limits; long texts are truncated, not split into chunks. At least one
 document is required for the unchanged SAE initialization.
 
-Preparation scans the files for validation, fingerprints and row counts, then
-encodes small batches without loading the collection into RAM. It writes the
-same token-cache format, grouping by source and role across input files. Changed
-input files or encoding settings require a new cache directory. Preparation uses
-the first selected GPU; training uses all selected GPUs, with a global token
-batch of 4,096 by default. Set `PREPARE_TOKENS=false` to train from an existing
-cache without reading the JSONL files. The original HF preparation remains the
-default when calling the Python script without `--texts-jsonl`.
+Before online training, a CPU scan validates and fingerprints the JSONL files,
+records byte offsets and counts retained tokens with the tokenizer. This builds
+an index of approximately 16 bytes per text plus metadata, without running
+DenseOn or saving embeddings. The index supports random text access and is
+checked for compatibility on reuse. Keep it under `data/`, as in the launcher,
+to keep generated index files out of Git.
+
+Each epoch shuffles all texts without replacement and visits each once. Frozen
+DenseOn encodes them in batches; retained token vectors are shuffled in a bounded
+in-memory pool and consumed in global SAE token batches. Leftover vectors carry
+across encoder batches and epochs. Only the final incomplete global token batch
+at the end of all epochs is dropped. The token counts determine the update and
+learning-rate schedule; `MAX_STEPS` optionally caps it. There is no source
+reweighting. Dictionary initialization still samples up to 128 documents per
+source, irrespective of how many input files contain that source's documents.
+
+One selected GPU uses plain Python and builds or validates the index before
+training. With multiple selected GPUs, the launcher first runs CPU-only
+`--online --index-only` in a single process, then starts `torchrun`. This phase
+loads the tokenizer but no DenseOn model, and completes the full file fingerprint
+checks before workers start. Distributed workers require the completed index and
+check file paths, sizes and modification times without repeating that long scan.
+Do not change input files during a run.
+
+If launching `torchrun` directly, first run the same training arguments with plain
+Python, `CUDA_VISIBLE_DEVICES=""` and the additional `--index-only` flag. Keep
+the input files, index directory and encoding settings identical; omit
+`--index-only` from the subsequent `torchrun` command. `run_pretraining.sh`
+performs these two commands automatically, avoiding distributed synchronization
+timeouts while indexing a large corpus.
+
+Each GPU runs frozen DenseOn as well as an SAE replica. The global SAE token batch
+is divided across workers, while `ENCODE_BATCH_SIZE` applies per GPU. This avoids
+embedding-cache disk usage at the cost of re-encoding texts each epoch.
+
+Training writes `metrics.jsonl` and saves the completed SAE under `final/`.
+Set `RESUME_CHECKPOINT` to a `training_state.pt` file to resume, keeping the input
+files, encoding settings, seed, world size, and both batch sizes unchanged. The
+trainer reconstructs pending token vectors from recorded text positions. The
+Python CLI also supports `--stop-after N` to stop without changing the planned
+learning-rate schedule.
+
+#### Optional: the original cached workflow
+
+The Python script still supports preparing all frozen embeddings first and then
+training from that cache. Without `--texts-jsonl`, preparation uses the authors'
+HF data; add `--texts-jsonl file1.jsonl file2.jsonl` to prepare local texts instead:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/sae-pretrain/train_slideon_sae.py \
+  --prepare --cache token-cache/slideon
+
+torchrun --standalone --nproc_per_node=8 scripts/sae-pretrain/train_slideon_sae.py \
+  --cache token-cache/slideon --output outputs/slideon-sae
+```
+
+These commands use the JSON defaults, including the 8,192-token length limits;
+the online launcher's 192-token overrides do not apply. The FP16 cache costs
+1,536 bytes per retained token with the 768-dimensional DenseOn backbone. All
+inputs must finish preparation before training can use the cache. Interrupted
+local-JSONL encoding restarts uncommitted streams from the beginning. Changing
+input files or encoding settings requires a new cache directory.
+
+HF preparation records dataset revisions; `--dataset-revisions pins.json` accepts
+a mapping of dataset IDs to exact commits. To resume cached training, pass
+`--resume path/to/training_state.pt` and retain the same config, cache, world size
+and `--buffer-tokens` setting. This cached workflow remains separate from the
+online launcher.
 
 The completed SAE is saved to `SAE_OUTPUT/final`. In `run_finetune.sh`, set
 `SAE_ID_OR_PATH="outputs/slideon-sae-texts/final"` (or your chosen output path).

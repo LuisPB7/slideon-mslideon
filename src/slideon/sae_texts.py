@@ -13,6 +13,22 @@ from pathlib import Path
 import numpy as np
 
 
+def validate_record(record, location):
+    """Validate the common online/offline text contract without changing text."""
+    if not isinstance(record, dict):
+        raise ValueError(f"{location}: expected a JSON object")
+    for key in ("source", "text"):
+        if not isinstance(record.get(key), str) or not record[key].strip():
+            raise ValueError(f"{location}: {key} must be a nonempty string")
+    if "id" in record and (not isinstance(record["id"], str) or not record["id"].strip()):
+        raise ValueError(f"{location}: id must be a nonempty string when supplied")
+    role = record.get("role", "document")
+    if role not in ("query", "document"):
+        raise ValueError(f"{location}: role must be query or document")
+    record["role"] = role
+    return record
+
+
 def _read_jsonl(paths, file_metadata):
     """Yield records in file order, accumulating fingerprints as files finish."""
     for path in paths:
@@ -28,19 +44,8 @@ def _read_jsonl(paths, file_metadata):
                     record = json.loads(line)
                 except (ValueError, UnicodeDecodeError) as error:
                     raise ValueError(f"{location}: invalid JSON record") from error
-                if not isinstance(record, dict):
-                    raise ValueError(f"{location}: expected a JSON object")
-                for key in ("source", "text"):
-                    if not isinstance(record.get(key), str) or not record[key].strip():
-                        raise ValueError(f"{location}: {key} must be a nonempty string")
-                if "id" in record and (not isinstance(record["id"], str) or not record["id"].strip()):
-                    raise ValueError(f"{location}: id must be a nonempty string when supplied")
-                role = record.get("role", "document")
-                if role not in ("query", "document"):
-                    raise ValueError(f"{location}: role must be query or document")
-                record["role"] = role
                 rows += 1
-                yield record
+                yield validate_record(record, location)
         file_metadata.append(dict(path=str(path), sha256=digest.hexdigest(), bytes=size, rows=rows))
 
 
