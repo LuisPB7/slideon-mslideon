@@ -158,6 +158,44 @@ trainer reconstructs pending token vectors from recorded text positions. The
 Python CLI also supports `--stop-after N` to stop without changing the planned
 learning-rate schedule.
 
+#### Original training texts without an embedding cache
+
+`run_pretraining_original.sh` now exports the authors' English training texts and
+uses online frozen DenseOn encoding. Edit its settings at the top, then run:
+
+```bash
+bash run_pretraining_original.sh
+```
+
+The new `scripts/sae-pretrain/export_original_texts.py` exporter reuses the same
+selection function as the cached preparation path: the mining-score filter,
+first ten eligible negatives, seven sampled negatives, and query/document ID
+deduplication within each source. It writes source/role/text JSONL, with no
+ranking relationships or teacher losses. Repeated text under distinct IDs stays
+repeated. The 1.57 million pair rows therefore do not map one-to-one to output
+text records. For the same dataset revision and selection settings, the selected
+text pools match the cached preparation path.
+
+By default, the export is `data/slideon-original-texts.jsonl`; its manifest records
+the resolved HF revision, selection settings, counts and checksum. Compatible
+completed exports are verified and reused. Incomplete or incompatible exports
+are rejected; choose a fresh output path after changing data selection. Export
+uses CPU only and loads one source's tables at a time. The usual HF raw-data
+downloads and text index still occupy disk, but dense token vectors stay in
+memory and are recreated each epoch.
+
+The launcher keeps the original model/loss/optimizer settings, three epochs and
+8,192-token limits. Its encoding batch defaults to four texts per GPU at those
+long limits. Online token order and the exact retained-token epoch/update budget
+differ from the cached path's buffered order and approximate raw-token schedule;
+this is not an identical training trajectory. Shortening the length limits or
+changing the number of epochs introduces further differences.
+
+The default final SAE is `outputs/slideon-sae-original-online/final`. Set
+`SAE_ID_OR_PATH` in `run_finetune.sh` to that directory. Existing cached-workflow
+checkpoints cannot resume into this online workflow; use a new training output.
+The launcher leaves existing embedding caches untouched.
+
 #### Optional: the original cached workflow
 
 The Python script still supports preparing all frozen embeddings first and then

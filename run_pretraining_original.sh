@@ -3,40 +3,44 @@
 # One-time setup in your Python environment: pip install -e .
 # Edit the settings below, save this file, then run it without arguments.
 # These fixed settings override the JSON config; environment variables do not override them.
-# This runs the repository's original English SAE recipe, without online JSONL input.
+# This uses the original English SAE text selection with ONLINE frozen encoding.
+# Dense token embeddings are never saved to disk.
 set -euo pipefail
 
 # DEVICE AND WORKFLOW: use true or false for the switches.
 PYTHON="python3"
 # One GPU: "0" or "2". Multiple GPUs: "0,1" or "0,1,2,3".
-# Preparation uses only the first selected GPU. SAE training uses all selected GPUs.
+# Export uses CPU only. Each training GPU runs frozen DenseOn and an SAE replica.
 export CUDA_VISIBLE_DEVICES="0"
-PREPARE_TOKENS=true
+PREPARE_TEXTS=true
 TRAIN_SAE=true
 
 # DATA AND MODEL: the JSON selects DenseOn and all nine English training sources
 # from lightonai/embeddings-fine-tuning-filtered-en. No english.jsonl is needed.
-# Preparation keeps queries, positives and seven sampled negatives after filtering,
-# deduplicates IDs within each source, and writes their frozen token embeddings.
+# Export keeps queries, positives and seven sampled negatives after filtering,
+# deduplicates IDs within each source, and writes raw text with source/role labels.
 TRAIN_CONFIG="scripts/training-configs/SlideOn-SAE/config.json"
-# This is the FULL embedding cache on disk, not the small online text index.
-# Each retained token takes 1,536 bytes with the default 768-dimensional FP16 vectors.
-# Choose a filesystem with enough space. Completed compatible streams are reused.
-CACHE_DIR="data/slideon-original-token-cache"
-# Optional JSON file mapping dataset IDs to exact commit SHAs. "" uses the config.
-# Otherwise, the first preparation resolves and records revisions in the cache manifest.
+TEXTS_JSONL="data/slideon-original-texts.jsonl"
+# Only text offsets and token counts are stored here, never DenseOn embeddings.
+INDEX_DIR="data/slideon-original-text-index"
+# Export-only pins: use an exact HF commit, or a JSON mapping dataset IDs to commits.
+# Keep dataset_revisions={} in TRAIN_CONFIG, since training consumes local JSONL.
+# With no pin, the first export resolves main and records its immutable revision;
+# later launches reuse that verified export instead of refreshing its contents.
+DATASET_REVISION=""
 DATASET_REVISIONS=""
 
 # OUTPUT: use a fresh directory for each new experiment.
-SAE_OUTPUT="outputs/slideon-sae-original"
+SAE_OUTPUT="outputs/slideon-sae-original-online"
 # Resume takes a FILE, not a directory. Use the same settings and GPU count.
-RESUME_CHECKPOINT=""  # e.g. outputs/slideon-sae-original/checkpoint-100000/training_state.pt
+RESUME_CHECKPOINT=""  # e.g. outputs/slideon-sae-original-online/checkpoint-100000/training_state.pt
 
-# TRAINING: defaults match the existing English SAE JSON configuration.
-# The original cached path retains its original token-based epoch/update schedule.
+# TRAINING: model/loss/optimizer defaults match the original English SAE config.
+# Online epochs visit every exported text once. Token order and the exact update
+# budget differ from the original cached path's approximate raw-token schedule.
 GLOBAL_TOKEN_BATCH_SIZE=4096  # Token vectors across all GPUs per SAE update.
-ENCODE_BATCH_SIZE=4          # Whole texts per frozen DenseOn forward during preparation.
-BUFFER_TOKENS=4000000        # Approximate in-memory shuffle buffer target during training.
+ENCODE_BATCH_SIZE=4          # Whole texts per DenseOn forward PER GPU, now during training.
+# Start conservatively at the original 8K limits. Increase encoding batch if it fits.
 QUERY_LENGTH=8192
 DOCUMENT_LENGTH=8192
 LEARNING_RATE=0.0003
@@ -57,37 +61,38 @@ if (( $# > 0 )); then
     exit 2
 fi
 
-# Both stages receive the same token-producing settings, so preparation and
-# training cannot accidentally disagree about DenseOn preprocessing or selection.
-COMMON_ARGS=(--config "$TRAIN_CONFIG" --cache "$CACHE_DIR"
-    --batch-size "$GLOBAL_TOKEN_BATCH_SIZE" --encode-batch-size "$ENCODE_BATCH_SIZE"
-    --buffer-tokens "$BUFFER_TOKENS" --query-length "$QUERY_LENGTH"
-    --document-length "$DOCUMENT_LENGTH" --learning-rate "$LEARNING_RATE"
-    --epochs "$EPOCHS" --seed "$SEED" --save-steps "$SAVE_STEPS" --log-steps "$LOG_STEPS")
-[[ -z "$MAX_STEPS" ]] || COMMON_ARGS+=(--max-steps "$MAX_STEPS")
-[[ -z "$DATASET_REVISIONS" ]] || COMMON_ARGS+=(--dataset-revisions "$DATASET_REVISIONS")
-if [[ "$BF16" == true ]]; then
-    COMMON_ARGS+=(--bf16)
-else
-    COMMON_ARGS+=(--no-bf16)
+# 1. Export the authors' selected texts without tokenization or a DenseOn forward.
+# Compatible completed JSONL is checksum-verified and reused; source downloads
+# are needed only for a new export. This step never creates an embedding cache.
+if [[ "$PREPARE_TEXTS" == true ]]; then
+    EXPORT_ARGS=(--config "$TRAIN_CONFIG" --output "$TEXTS_JSONL" --seed "$SEED")
+    [[ -z "$DATASET_REVISION" ]] || EXPORT_ARGS+=(--revision "$DATASET_REVISION")
+    [[ -z "$DATASET_REVISIONS" ]] || EXPORT_ARGS+=(--dataset-revisions "$DATASET_REVISIONS")
+    CUDA_VISIBLE_DEVICES="" "$PYTHON" scripts/sae-pretrain/export_original_texts.py "${EXPORT_ARGS[@]}"
 fi
 
-# 1. Fetch/filter the authors' data and encode its texts into the reusable cache.
-# Keep this single-process even when SAE training will use several GPUs.
-# Set PREPARE_TOKENS=false to train directly from an already prepared cache.
-if [[ "$PREPARE_TOKENS" == true ]]; then
-    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}" "$PYTHON" \
-        scripts/sae-pretrain/train_slideon_sae.py "${COMMON_ARGS[@]}" --prepare
-fi
-
-# 2. Train the SAE on cached tokens. A failed preparation stops the script above.
-# The trainer validates the cache, preserves its original losses/optimizer, and
-# writes SAE_OUTPUT/final only after completing the requested training schedule.
+# 2. Use the same online provider as run_pretraining.sh: frozen DenseOn produces
+# a bounded pool of shuffled token vectors, consumed in fixed-size SAE batches.
 if [[ "$TRAIN_SAE" == true ]]; then
-    TRAIN_ARGS=("${COMMON_ARGS[@]}" --output "$SAE_OUTPUT")
+    TRAIN_ARGS=(--config "$TRAIN_CONFIG" --online --texts-jsonl "$TEXTS_JSONL"
+        --index-dir "$INDEX_DIR" --output "$SAE_OUTPUT"
+        --batch-size "$GLOBAL_TOKEN_BATCH_SIZE" --encode-batch-size "$ENCODE_BATCH_SIZE"
+        --query-length "$QUERY_LENGTH" --document-length "$DOCUMENT_LENGTH"
+        --learning-rate "$LEARNING_RATE" --epochs "$EPOCHS" --seed "$SEED"
+        --save-steps "$SAVE_STEPS" --log-steps "$LOG_STEPS")
+    [[ -z "$MAX_STEPS" ]] || TRAIN_ARGS+=(--max-steps "$MAX_STEPS")
+    if [[ "$BF16" == true ]]; then
+        TRAIN_ARGS+=(--bf16)
+    else
+        TRAIN_ARGS+=(--no-bf16)
+    fi
     [[ -z "$RESUME_CHECKPOINT" ]] || TRAIN_ARGS+=(--resume "$RESUME_CHECKPOINT")
     TRAIN_COMMAND=("$PYTHON")
     if [[ "$CUDA_VISIBLE_DEVICES" == *,* ]]; then
+        # Finish the CPU index scan before workers start, avoiding synchronization
+        # timeouts on large JSONL files. No DenseOn weights are loaded here.
+        CUDA_VISIBLE_DEVICES="" "$PYTHON" scripts/sae-pretrain/train_slideon_sae.py \
+            "${TRAIN_ARGS[@]}" --index-only
         TRAIN_COMMAND+=(-m torch.distributed.run --standalone --nproc_per_node=gpu)
     fi
     "${TRAIN_COMMAND[@]}" scripts/sae-pretrain/train_slideon_sae.py "${TRAIN_ARGS[@]}"
