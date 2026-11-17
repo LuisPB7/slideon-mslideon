@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 eval = ["mteb==2.18.14", "scipy>=1.11"]
+data = ["ir-datasets>=0.5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

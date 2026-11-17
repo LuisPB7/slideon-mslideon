@@ -1,6 +1,6 @@
 """Pretrain SlideOn-SAE: frozen token preparation, model, loss, and training loop."""
 # Reading map: main() at the bottom chooses one of two independent stages.
-#   --prepare: dataset tables -> selected texts -> frozen DenseOn tokens -> disk cache.
+#   --prepare: dataset tables OR text JSONL -> frozen DenseOn tokens -> disk cache.
 #   training: disk cache -> shuffled token batches -> TopKSAE -> raw SAE checkpoint.
 # Start with main(), then Recipe, then follow only the branch you intend to run.
 # DenseOn is never optimized here: the train() branch does not load it at all.
@@ -25,6 +25,7 @@ from transformers import AutoModel, AutoTokenizer
 
 from slideon.modeling_slideon import TokenProjection
 from slideon.models import SlideOn
+from slideon.sae_texts import prepare_jsonl_cache
 
 
 # Recipe is the experiment contract shared by preparation, training, and export.
@@ -285,11 +286,16 @@ class TopKSAE(nn.Module):
 # Extract only settings that determine cached token contents. An existing cache
 # can be reused when optimizer or SAE hyperparameters change, but not when the
 # backbone, prompts, precision, source selection, or token dimensions change.
-def cache_recipe(config):
+def cache_recipe(config, input_mode="hf"):
     """Only token-producing settings determine cache compatibility."""
     keys = ("name", "base_model", "base_model_revision", "d_model", "d_lift", "bf16",
-            "query_length", "document_length", "query_prompt", "document_prompt",
-            "dataset_prefix", "nv_threshold", "num_negatives", "sampled_negatives", "seed", "splits")
+            "query_length", "document_length", "query_prompt", "document_prompt")
+    if input_mode == "hf":
+        keys += ("dataset_prefix", "nv_threshold", "num_negatives", "sampled_negatives", "seed", "splits")
+    elif input_mode != "jsonl":
+        raise ValueError(f"Unknown token-cache input mode: {input_mode}")
+    # Raw JSONL has no mined-negative selection. Its ordered file fingerprints
+    # are checked separately in prepare_jsonl_cache; these settings control encoding.
     return json.loads(json.dumps({key: config.get(key) for key in keys}))
 
 
@@ -424,6 +430,8 @@ def prepare_tokens(recipe, output, encode_batch_size=4, dataset_revisions=None):
     # revision pins; silently mixing embeddings from different sources is unsafe.
     if manifest_file.exists():
         manifest = json.loads(manifest_file.read_text())
+        if manifest.get("input", {}).get("type", "hf") != "hf":
+            raise ValueError("This cache uses JSONL input; prepare it with --texts-jsonl")
         if cache_recipe(manifest["recipe"]) != cache_recipe(recipe_config):
             raise ValueError("Cache recipe mismatch")
         if pins:
@@ -508,6 +516,15 @@ def prepare_tokens(recipe, output, encode_batch_size=4, dataset_revisions=None):
     temporary.replace(manifest_file)
 
 
+def prepare_text_tokens(recipe, output, texts_jsonl, encode_batch_size=4):
+    """Use the same frozen encoder and cache contract with standalone text records."""
+    prepare_jsonl_cache(
+        recipe, output, texts_jsonl, encode_batch_size,
+        make_encoder=lambda: FrozenTokens(recipe, torch.device("cuda" if torch.cuda.is_available() else "cpu")),
+        cache_recipe=cache_recipe,
+    )
+
+
 # TokenCache is a read-only view over prepared numeric files and their manifest.
 # Memory mapping permits sequence slices without loading the entire corpus into RAM.
 # The class also supplies a small document-token pool for dictionary initialization.
@@ -518,7 +535,9 @@ class TokenCache:
         self.root = Path(root)
         self.recipe = recipe
         self.manifest = json.loads((self.root / "manifest.json").read_text())
-        if not self.manifest.get("complete") or cache_recipe(self.manifest["recipe"]) != cache_recipe(recipe.checkpoint_config()):
+        input_mode = self.manifest.get("input", {}).get("type", "hf")
+        if (not self.manifest.get("complete") or
+                cache_recipe(self.manifest["recipe"], input_mode) != cache_recipe(recipe.checkpoint_config(), input_mode)):
             raise ValueError("Token cache is incomplete or belongs to a different recipe")
         self.sources = self.manifest["sources"]
         self.arrays, self.offsets, self.chars = [], [], []
@@ -937,6 +956,8 @@ def parse_args(argv=None):
     parser.add_argument("--output", help="Training output directory")
     parser.add_argument("--prepare", action=argparse.BooleanOptionalAction, default=False,
                         help="Prepare tokens only, using one process")
+    parser.add_argument("--texts-jsonl", type=str, nargs="+",
+                        help="Prepare from text JSONL files instead of the original HF tables (requires --prepare)")
     parser.add_argument("--encode-batch-size", type=int)
     parser.add_argument("--dataset-revisions", help="JSON file mapping dataset repositories to exact revisions")
     parser.add_argument("--resume", help="Path to a training_state.pt from this trainer")
@@ -972,6 +993,11 @@ def parse_args(argv=None):
             raise ValueError("--cache is required")
         if not args.prepare and not args.output:
             raise ValueError("--output is required for training")
+        if args.texts_jsonl is not None:
+            if not args.prepare or not args.texts_jsonl:
+                raise ValueError("--texts-jsonl requires --prepare and at least one input file")
+            if args.dataset_revisions:
+                raise ValueError("dataset_revisions applies to HF tables, not --texts-jsonl input")
         if min(args.save_steps, args.log_steps, args.buffer_tokens, args.encode_batch_size) < 1:
             raise ValueError("Step counts, buffer size, and encoding batch size must be positive")
         if args.stop_after is not None and args.stop_after < 1:
@@ -990,7 +1016,10 @@ def main(argv=None):
     if args.prepare:
         if int(os.environ.get("WORLD_SIZE", "1")) != 1:
             raise ValueError("Token preparation must use one process")
-        prepare_tokens(recipe, args.cache, args.encode_batch_size, args.dataset_revisions)
+        if args.texts_jsonl is None:
+            prepare_tokens(recipe, args.cache, args.encode_batch_size, args.dataset_revisions)
+        else:
+            prepare_text_tokens(recipe, args.cache, args.texts_jsonl, args.encode_batch_size)
         # Persist resolved dataset SHAs, replacing floating/requested revision names
         # in the run record with the exact commits used to produce the cached vectors.
         manifest = json.loads((Path(args.cache) / "manifest.json").read_text())

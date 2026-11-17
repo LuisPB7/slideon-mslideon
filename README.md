@@ -69,6 +69,77 @@ Resume with `--resume path/to/training_state.pt`, keeping the same config, token
 cache, world size, and buffer size. `--stop-after N` allows an early stop without
 changing the learning-rate schedule.
 
+To pretrain from your own text collection, edit the constants at the top of
+`run_pretraining.sh`, then run `bash run_pretraining.sh`. Set `TEXTS_JSONL` to one
+or more local JSONL files, and choose `CACHE_DIR` and `SAE_OUTPUT`. Each line is
+an independent text, for example:
+
+```json
+{"id":"p123","source":"msmarco_v1","role":"document","text":"A passage to encode."}
+{"id":"q456","source":"msmarco_v1","role":"query","text":"A question to encode?"}
+{"id":"f789","source":"fineweb","text":"A web document to encode."}
+```
+
+Build the three corpus files and the five artificial-query files with:
+
+```bash
+pip install -e '.[data]'
+python scripts/sae-pretrain/prepare_msmarco.py --version 1
+python scripts/sae-pretrain/prepare_msmarco.py --version 2
+python scripts/sae-pretrain/prepare_fineweb.py
+python scripts/sae-pretrain/prepare_artificial_queries.py --input-dir /path/to/pickles
+```
+
+Outputs default to this repository's `data/` directory, regardless of the working
+directory: `msmarco-v1.jsonl`, `msmarco-v2.jsonl`, `fineweb.jsonl`, and
+`msmarco-v1-artificial-queries-0.jsonl` through `-4.jsonl`. Each has a
+`.manifest.json` sidecar containing provenance, row counts and an output checksum.
+Generated data is ignored by Git.
+
+The MSMARCO exporter uses the full passage collections
+[`msmarco-passage`](https://ir-datasets.com/msmarco-passage.html) and
+[`msmarco-passage-v2`](https://ir-datasets.com/msmarco-passage-v2.html), copying
+only `doc.text` as provided by `ir_datasets`. FineWeb streams the
+[`fineweb-edu-dedup` subset of SmolLM-Corpus](https://huggingface.co/datasets/HuggingFaceTB/smollm-corpus/viewer/fineweb-edu-dedup),
+copying only `text`, from a pinned Hub revision. Titles and metadata are not
+prepended. No tokenization or truncation happens during export. Blank texts are
+skipped and counted because the SAE input contract requires nonblank texts;
+other texts, whitespace and duplicates are preserved.
+
+The artificial-query exporter reads your trusted
+`top5_doct5queries-_part_0.pkl` through `top5_doct5queries-_part_4.pkl` dictionaries.
+It keeps integer IDs as strings and assigns `role="query"`. Each whole pickle
+part must fit in RAM; only one part is loaded at a time. Use `--parts 0 2` to
+export selected parts, or omit `--input-dir` when the pickles are already in
+`data/`. The other three files contain documents. The launcher lists these three
+corpora by default, with optional query-part lines ready to uncomment.
+
+All exporters accept `--limit N` for small output checks and `--overwrite` to
+replace a completed export. A limit does not necessarily limit upstream downloads:
+`ir_datasets` may download the collection before yielding its first passage.
+Failures do not publish a partial final JSONL. Export restarts from the beginning;
+after a hard interruption, remove any stale `.partial` files before retrying.
+
+`source` and nonblank `text` are required strings. `role` defaults to `document`;
+`id` is optional. Texts and duplicates are preserved, with no balancing, negative
+selection or deduplication. Queries and documents use their existing prompts and
+length limits; long texts are truncated, not split into chunks. At least one
+document is required for the unchanged SAE initialization.
+
+Preparation scans the files for validation, fingerprints and row counts, then
+encodes small batches without loading the collection into RAM. It writes the
+same token-cache format, grouping by source and role across input files. Changed
+input files or encoding settings require a new cache directory. Preparation uses
+the first selected GPU; training uses all selected GPUs, with a global token
+batch of 4,096 by default. Set `PREPARE_TOKENS=false` to train from an existing
+cache without reading the JSONL files. The original HF preparation remains the
+default when calling the Python script without `--texts-jsonl`.
+
+The completed SAE is saved to `SAE_OUTPUT/final`. In `run_finetune.sh`, set
+`SAE_ID_OR_PATH="outputs/slideon-sae-texts/final"` (or your chosen output path).
+The default DenseOn revision already matches; if you change the SAE backbone,
+also match `BACKBONE_REVISION` in the fine-tuning launcher.
+
 ### Retrieval fine-tuning
 
 Provide JSONL with a fixed number of negatives. Teacher scores are ordered

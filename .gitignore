@@ -6,3 +6,4 @@ outputs/
 checkpoints/
 token-cache/
 results/
+data/
