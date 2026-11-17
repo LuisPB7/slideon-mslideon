@@ -22,6 +22,7 @@ from huggingface_hub import HfApi, snapshot_download
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.nn import functional as F
+from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 from slideon.modeling_slideon import TokenProjection
@@ -887,7 +888,10 @@ def train(recipe, cache_path, output, *, resume=None, stop_after=None, save_step
         raise ValueError("Requested stopping point is at or before the resumed step")
     # One loop iteration is one global token-batch update; there is no gradient
     # accumulation in this SAE trainer. DDP synchronizes gradients during backward().
-    for step in range(start, end):
+    # Only rank zero displays progress. Resumes start at their saved update, and
+    # timing includes online DenseOn refills as well as the SAE updates themselves.
+    for step in tqdm(range(start, end), total=steps, initial=start,
+                     desc="SAE pretraining", unit="step", dynamic_ncols=True, disable=rank != 0):
         x = pending if pending is not None else next(batches)
         pending = None
         optimizer.zero_grad(set_to_none=True)
@@ -929,7 +933,8 @@ def train(recipe, cache_path, output, *, resume=None, stop_after=None, save_step
             if rank == 0:
                 with (output / "metrics.jsonl").open("a") as stream:
                     stream.write(json.dumps(metrics, allow_nan=False) + "\n")
-                print(json.dumps(metrics), flush=True)
+                # Keep the JSON log readable without overwriting the progress bar.
+                tqdm.write(json.dumps(metrics))
         # Periodic snapshots and the terminal snapshot share the same serialization
         # path; the final flag depends on finishing the full schedule, not this call.
         if (step + 1) % save_steps == 0 and step + 1 != end:
