@@ -13,13 +13,14 @@ PYTHON="python3"
 export CUDA_VISIBLE_DEVICES="0"
 TRAIN_SAE=true
 
-# DATA: list the raw-text JSONL files in their intended reading order.
-# Each row requires source/text; id and role (query/document; default document) are optional.
+# DATA: list .jsonl texts, pretokenized .pt descriptors, or a mixture of both.
+# The variable keeps its original name for compatibility; the suffix selects the loader.
+# JSONL rows need source/text; id and role (query/document; default document) are optional.
 # Different files may share a source. This is not the fine-tuning english.jsonl.
 TEXTS_JSONL=(
-    "data/msmarco-v1.jsonl"
-    "data/msmarco-v2.jsonl"
-    "data/fineweb.jsonl"
+    "data/msmarco-v1.jsonl"  # Or "data/msmarco-v1.pt" after prepare_input_ids.py
+    "data/msmarco-v2.jsonl"  # Or "data/msmarco-v2.pt"
+    "data/fineweb.jsonl"     # Or "data/fineweb.pt"; no intermediate JSONL needed
     # Uncomment any generated query parts you want to include:
     # "data/msmarco-v1-artificial-queries-0.jsonl"
     # "data/msmarco-v1-artificial-queries-1.jsonl"
@@ -40,6 +41,8 @@ RESUME_CHECKPOINT=""  # e.g. outputs/slideon-sae-texts/checkpoint-100000/trainin
 
 # TRAINING: SAE/optimizer defaults match the existing English configuration.
 # This launcher's 192-token limits override the JSON's longer context limits.
+# For .pt inputs, BOTH limits must match those used by prepare_input_ids.py.
+# The saved tokenizer revision and prompts must match TRAIN_CONFIG as well.
 # The batch counts TOKEN VECTORS globally, not queries/documents per GPU.
 GLOBAL_TOKEN_BATCH_SIZE=4096
 LEARNING_RATE=0.0003

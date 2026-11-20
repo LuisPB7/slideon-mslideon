@@ -1,4 +1,4 @@
-"""Online frozen-token batches backed by a compact index of raw JSONL records.
+"""Online frozen-token batches backed by JSONL texts or pretokenized PT records.
 
 The on-disk index contains file offsets and token counts, never embeddings.
 Each refill encodes one text batch per worker. Its token vectors stay in memory
@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 
 from .sae_texts import validate_record
+from .sae_tokens import PretokenizedDataset
 
 
 # Group identity supplies source/role, so each text needs only sixteen bytes.
@@ -43,12 +44,23 @@ def _fingerprint(path):
                 sha256=digest.hexdigest())
 
 
+def _without_checksums(value):
+    """Compare startup metadata without re-reading large shards under NCCL."""
+    if isinstance(value, dict):
+        return {key: _without_checksums(item) for key, item in value.items() if key != "sha256"}
+    if isinstance(value, list):
+        return [_without_checksums(item) for item in value]
+    return value
+
+
 class OnlineTokenSource:
     """Indexed texts, frozen encoder and the exact finite token-training budget.
 
     ``encoder`` provides count_tokens(records) and encode_records(records). Both
     use the same role-aware preprocessing; only the latter runs DenseOn. Encoding
     returns one FP16 tensor per text, after padding exclusion and normalization.
+    PT inputs also require matching encoder.tokenization_metadata(), since their
+    prompts, special tokens and truncation have already been applied on disk.
     """
 
     def __init__(self, recipe, texts_jsonl, index_path, encoder, encode_batch_size,
@@ -61,8 +73,11 @@ class OnlineTokenSource:
         self.root = Path(index_path)
         self.paths = [Path(path).resolve() for path in texts_jsonl]
         if not self.paths or len(set(self.paths)) != len(self.paths):
-            raise ValueError("Supply one or more distinct JSONL files")
+            raise ValueError("Supply one or more distinct JSONL or PT input files")
+        if any(path.suffix.lower() not in (".jsonl", ".pt") for path in self.paths):
+            raise ValueError("Online input files must end in .jsonl or .pt")
         self._streams = {}
+        self._tokenized = {}
         self.arrays = []
         self.encoding = {key: recipe.checkpoint_config()[key] for key in ENCODING_KEYS}
 
@@ -76,27 +91,48 @@ class OnlineTokenSource:
                 self._prepare_index()
             except Exception as exc:
                 if world == 1:
+                    self.close()
                     raise
                 error = f"{type(exc).__name__}: {exc}"
         if world > 1:
             message = [error]
             dist.broadcast_object_list(message, src=0)
             if message[0] is not None:
-                raise RuntimeError(f"Online JSONL indexing failed: {message[0]}")
+                self.close()
+                raise RuntimeError(f"Online input indexing failed: {message[0]}")
 
-        self.manifest = json.loads((self.root / "manifest.json").read_text())
-        if not self.manifest.get("complete") or self.manifest.get("encoding") != self.encoding:
-            raise ValueError("Online text index is incomplete or has different encoding settings")
-        self.groups = self.manifest["groups"]
-        self.ends = np.cumsum([group["rows"] for group in self.groups], dtype=np.int64)
-        self.total_rows = int(self.ends[-1])
-        self.total_tokens = sum(group["tokens"] for group in self.groups)
-        self.steps = self.total_tokens * recipe.epochs // recipe.batch_size
-        for group in self.groups:
-            path = self.root / group["index"]
-            if path.stat().st_size != group["rows"] * RECORD_DTYPE.itemsize:
-                raise ValueError(f"Invalid online index size: {path}")
-            self.arrays.append(np.memmap(path, mode="r", dtype=RECORD_DTYPE, shape=(group["rows"],)))
+        try:
+            self.manifest = json.loads((self.root / "manifest.json").read_text())
+            if not self.manifest.get("complete") or self.manifest.get("encoding") != self.encoding:
+                raise ValueError("Online text index is incomplete or has different encoding settings")
+            self.groups = self.manifest["groups"]
+            self.ends = np.cumsum([group["rows"] for group in self.groups], dtype=np.int64)
+            self.total_rows = int(self.ends[-1])
+            self.total_tokens = sum(group["tokens"] for group in self.groups)
+            self.steps = self.total_tokens * recipe.epochs // recipe.batch_size
+            for group in self.groups:
+                path = self.root / group["index"]
+                if path.stat().st_size != group["rows"] * RECORD_DTYPE.itemsize:
+                    raise ValueError(f"Invalid online index size: {path}")
+                self.arrays.append(np.memmap(path, mode="r", dtype=RECORD_DTYPE, shape=(group["rows"],)))
+        except Exception:
+            self.close()
+            raise
+
+    def _tokenized_reader(self, file_index):
+        if file_index not in self._tokenized:
+            self._tokenized[file_index] = PretokenizedDataset(
+                self.paths[file_index], expected_tokenization=self.encoder.tokenization_metadata())
+        return self._tokenized[file_index]
+
+    def _input_fingerprint(self, file_index, *, full):
+        path = self.paths[file_index]
+        if path.suffix.lower() == ".pt":
+            return self._tokenized_reader(file_index).fingerprint(full=full)
+        if full:
+            return _fingerprint(path)
+        stat = path.stat()
+        return dict(path=str(path), bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
 
     def _prepare_index(self):
         manifest_path = self.root / "manifest.json"
@@ -114,17 +150,15 @@ class OnlineTokenSource:
                     # The launcher just verified complete SHA256 fingerprints in
                     # its CPU-only stage. Check that files have not changed since
                     # that scan without doing another multi-hour read under NCCL.
-                    files = [dict(path=str(path), bytes=path.stat().st_size,
-                                  mtime_ns=path.stat().st_mtime_ns) for path in self.paths]
-                    expected = [{key: item.get(key) for key in ("path", "bytes", "mtime_ns")}
-                                for item in previous["files"]]
+                    files = [self._input_fingerprint(index, full=False) for index in range(len(self.paths))]
+                    expected = _without_checksums(previous["files"])
                     if files != expected:
-                        raise ValueError("Online JSONL input metadata changed; run --online --index-only first")
+                        raise ValueError("Online input metadata changed; run --online --index-only first")
                     return
-                print("Checking online JSONL input fingerprints...", flush=True)
-                files = [_fingerprint(path) for path in self.paths]
+                print("Checking online input fingerprints...", flush=True)
+                files = [self._input_fingerprint(index, full=True) for index in range(len(self.paths))]
                 if previous["files"] != files:
-                    raise ValueError("Online JSONL input differs from the index; choose a new --index-dir")
+                    raise ValueError("Online input differs from the index; choose a new --index-dir")
                 return
             if self.world > 1:
                 raise ValueError("Online index is incomplete; run --online --index-only first")
@@ -132,9 +166,25 @@ class OnlineTokenSource:
         manifest = dict(type="online-jsonl-index", version=1, encoding=self.encoding,
                         files=[], groups=[], complete=False)
         _write_manifest(manifest_path, manifest)
-        print("Indexing JSONL text offsets and token counts (no DenseOn forward pass)...", flush=True)
+        print("Indexing input records and token counts (no DenseOn forward pass)...", flush=True)
         groups, pending = {}, []
         with ExitStack() as stack:
+            def append_record(source, role, file_index, offset, count):
+                count = int(count)
+                if count < 1 or count > np.iinfo(np.uint32).max:
+                    raise ValueError("Each indexed text must produce a positive uint32 token count")
+                key = (source, role)
+                if key not in groups:
+                    name = f"records-{len(groups):05d}.idx"
+                    stream = stack.enter_context((self.root / (name + ".partial")).open("wb"))
+                    groups[key] = dict(source=key[0], role=key[1], index=name,
+                                       rows=0, tokens=0, stream=stream)
+                group = groups[key]
+                item = np.array((file_index, offset, count), dtype=RECORD_DTYPE)
+                group["stream"].write(item.tobytes())
+                group["rows"] += 1
+                group["tokens"] += count
+
             def flush():
                 if not pending:
                     return
@@ -142,23 +192,22 @@ class OnlineTokenSource:
                 if len(counts) != len(pending):
                     raise ValueError("Tokenizer returned an incorrect number of token counts")
                 for (record, file_index, offset), count in zip(pending, counts):
-                    count = int(count)
-                    if count < 1 or count > np.iinfo(np.uint32).max:
-                        raise ValueError("Each indexed text must produce a positive uint32 token count")
-                    key = (record["source"], record["role"])
-                    if key not in groups:
-                        name = f"records-{len(groups):05d}.idx"
-                        stream = stack.enter_context((self.root / (name + ".partial")).open("wb"))
-                        groups[key] = dict(source=key[0], role=key[1], index=name,
-                                           rows=0, tokens=0, stream=stream)
-                    group = groups[key]
-                    item = np.array((file_index, offset, count), dtype=RECORD_DTYPE)
-                    group["stream"].write(item.tobytes())
-                    group["rows"] += 1
-                    group["tokens"] += count
+                    append_record(record["source"], record["role"], file_index, offset, count)
                 pending.clear()
 
             for file_index, path in enumerate(self.paths):
+                if path.suffix.lower() == ".pt":
+                    # Preserve record/group order across mixed inputs. PT sequences
+                    # already include prompts/special tokens and need no tokenizer.
+                    flush()
+                    reader = self._tokenized_reader(file_index)
+                    identity = reader.fingerprint(full=True)
+                    for row, source, role, count in reader.iter_index():
+                        append_record(source, role, file_index, row, count)
+                    if reader.fingerprint(full=False) != _without_checksums(identity):
+                        raise ValueError(f"Pretokenized input changed during indexing: {path}")
+                    manifest["files"].append(identity)
+                    continue
                 before = path.stat()
                 digest, size = hashlib.sha256(), 0
                 with path.open("rb") as stream:
@@ -184,7 +233,7 @@ class OnlineTokenSource:
                                               sha256=digest.hexdigest()))
             flush()
             if not groups or not any(role == "document" for _, role in groups):
-                raise ValueError("Online JSONL input needs at least one document for SAE initialization")
+                raise ValueError("Online input needs at least one document for SAE initialization")
 
         for group in groups.values():
             (self.root / (group["index"] + ".partial")).replace(self.root / group["index"])
@@ -207,14 +256,18 @@ class OnlineTokenSource:
         part, row = self.location(index)
         item = self.arrays[part][row]
         file_index = int(item["file"])
-        if file_index not in self._streams:
-            self._streams[file_index] = self.paths[file_index].open("rb")
-        stream = self._streams[file_index]
-        stream.seek(int(item["offset"]))
-        record = validate_record(json.loads(stream.readline()), f"{self.paths[file_index]} byte {int(item['offset'])}")
+        if self.paths[file_index].suffix.lower() == ".pt":
+            # offset is a PT record number instead of a JSONL byte position.
+            record = self._tokenized_reader(file_index).record(int(item["offset"]))
+        else:
+            if file_index not in self._streams:
+                self._streams[file_index] = self.paths[file_index].open("rb")
+            stream = self._streams[file_index]
+            stream.seek(int(item["offset"]))
+            record = validate_record(json.loads(stream.readline()), f"{self.paths[file_index]} byte {int(item['offset'])}")
         group = self.groups[part]
         if (record["source"], record["role"]) != (group["source"], group["role"]):
-            raise ValueError("JSONL source/role changed after indexing")
+            raise ValueError("Input source/role changed after indexing")
         return record
 
     def encode(self, indices):
@@ -254,6 +307,9 @@ class OnlineTokenSource:
         for array in self.arrays:
             array._mmap.close()
         self.arrays.clear()
+        for reader in self._tokenized.values():
+            reader.close()
+        self._tokenized.clear()
 
 
 class OnlineTokenBatches:

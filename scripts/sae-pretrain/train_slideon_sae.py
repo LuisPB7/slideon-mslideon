@@ -1,12 +1,13 @@
 """Pretrain SlideOn-SAE: frozen token preparation, model, loss, and training loop."""
 # Reading map: main() at the bottom chooses one of two independent stages.
 #   --prepare: dataset tables OR text JSONL -> frozen DenseOn tokens -> disk cache.
-#   --online: JSONL texts -> frozen DenseOn -> shuffled in-memory token batches.
+#   --online: JSONL texts / pretokenized .pt -> frozen DenseOn -> in-memory batches.
 #   training: online batches OR disk cache -> TopKSAE -> raw SAE checkpoint.
 # Start with main(), then Recipe, then follow only the branch you intend to run.
 # DenseOn is never optimized here; online training uses it only for inference.
 # Retrieval fine-tuning later consumes the raw SAE directory saved by this script.
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -28,7 +29,7 @@ from transformers import AutoModel, AutoTokenizer
 from slideon.modeling_slideon import TokenProjection
 from slideon.models import SlideOn
 from slideon.sae_data import filter_texts
-from slideon.sae_texts import prepare_jsonl_cache
+from slideon.sae_texts import prepare_jsonl_cache, validate_record
 from slideon.sae_online import OnlineTokenSource
 
 
@@ -314,6 +315,7 @@ class FrozenTokens(torch.nn.Module):
     # English needs only the Transformer; any dense sequence-pooling layer is omitted.
     def __init__(self, recipe, device, load_encoder=True):
         super().__init__()
+        self.recipe = recipe
         download_kwargs = {} if load_encoder else dict(allow_patterns=[
             "config.json", "config_sentence_transformers.json", "tokenizer*",
             "special_tokens_map.json", "added_tokens.json", "vocab.*", "merges.txt", "*.model",
@@ -355,14 +357,76 @@ class FrozenTokens(torch.nn.Module):
         # cache construction cannot accumulate backbone gradients.
         self.to(device).eval().requires_grad_(False)
 
+    def tokenization_metadata(self):
+        """Identify exactly which token sequences a pretokenized file contains."""
+        if self.recipe.d_lift or self.encoder_config.get("skiplist_words"):
+            raise ValueError("Pretokenized input currently supports English DenseOn without token skip lists only")
+        if not self.tokenizer.is_fast:
+            raise ValueError("Pretokenized input requires the DenseOn fast tokenizer")
+        # Fast tokenizers mutate these two runtime settings on every call. The
+        # configured limits/sides below identify them without a batch-dependent hash.
+        backend = json.loads(self.tokenizer.backend_tokenizer.to_str())
+        backend.pop("padding", None)
+        backend.pop("truncation", None)
+        digest = hashlib.sha256(json.dumps(backend, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        return dict(version=1, base_model=self.recipe.base_model,
+                    base_model_revision=self.recipe.base_model_revision,
+                    tokenizer_sha256=digest, tokenizer_class=type(self.tokenizer).__name__,
+                    max_token_id=max(self.tokenizer.get_vocab().values()),
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    special_token_ids=sorted(self.tokenizer.all_special_ids),
+                    model_input_names=list(self.tokenizer.model_input_names),
+                    padding_side=self.tokenizer.padding_side, truncation_side=self.tokenizer.truncation_side,
+                    query_length=self.settings["query_length"], document_length=self.settings["document_length"],
+                    prompts=dict(self.settings["prompts"]),
+                    prefixes={role: self.encoder_config.get(role + "_prefix", "")
+                              for role in ("query", "document")},
+                    retained_tokens="all_unpadded_including_prompt_and_special_tokens")
+
+    def tokenize_records(self, records):
+        """CPU-only preparation: save each complete, unpadded prompted sequence."""
+        if self.recipe.d_lift or self.encoder_config.get("skiplist_words"):
+            raise ValueError("Pretokenized input currently supports English DenseOn without token skip lists only")
+        records = [validate_record(record, f"tokenization batch row {index + 1}")
+                   for index, record in enumerate(records)]
+        features = self._record_features(records)
+        # The English backbone only needs input IDs and masks. Do not silently
+        # discard additional tokenizer inputs if a different tokenizer is supplied.
+        if set(features) - {"input_ids", "attention_mask", "token_type_ids"}:
+            raise ValueError("Unsupported tokenizer inputs for pretokenized storage")
+        if "token_type_ids" in features and features["token_type_ids"].any():
+            raise ValueError("Pretokenized storage cannot discard nonzero token_type_ids")
+        result = []
+        for index, record in enumerate(records):
+            item = {key: record[key] for key in ("source", "id") if key in record}
+            item.update(role=record.get("role", "document"),
+                        input_ids=features["input_ids"][index][features["attention_mask"][index].bool()].clone())
+            result.append(item)
+        return result
+
     def _record_features(self, records):
-        """Apply role-specific prompts/limits, then pad ONE mixed-role batch."""
+        """Tokenize raw texts, reuse saved IDs, then pad ONE mixed-format batch."""
         groups = []
         for role in ("query", "document"):
-            indices = [i for i, record in enumerate(records) if record.get("role", "document") == role]
+            indices = [i for i, record in enumerate(records)
+                       if record.get("role", "document") == role and "text" in record]
             if indices:
                 features = self.preprocess([records[i]["text"] for i in indices], task=role)
                 groups.append((indices, {k: v for k, v in features.items() if isinstance(v, torch.Tensor)}))
+        for index, record in enumerate(records):
+            if "text" in record or "input_ids" not in record:
+                continue
+            role = self._task(record.get("role", "document"))
+            ids = torch.as_tensor(record["input_ids"])
+            if ids.ndim != 1 or ids.dtype not in (torch.uint8, torch.uint16, torch.int16, torch.int32, torch.int64):
+                raise ValueError("Pretokenized input_ids must be a one-dimensional integer sequence")
+            ids = ids.to(device="cpu", dtype=torch.long)
+            if not 0 < ids.numel() <= self.settings[role + "_length"] or (ids < 0).any():
+                raise ValueError("Pretokenized sequence is empty, invalid, or exceeds the configured role length")
+            # Prompts and special tokens are already present. Masks are rebuilt
+            # from boundaries, so no padded arrays need to live on disk.
+            groups.append(([index], dict(input_ids=ids.unsqueeze(0),
+                                         attention_mask=torch.ones_like(ids).unsqueeze(0))))
         if sum(len(indices) for indices, _ in groups) != len(records) or not groups:
             raise ValueError("Expected a nonempty batch of query/document records")
         width = max(features["input_ids"].shape[1] for _, features in groups)
@@ -1004,12 +1068,12 @@ def parse_args(argv=None):
     parser.add_argument("--prepare", action=argparse.BooleanOptionalAction, default=False,
                         help="Prepare tokens only, using one process")
     parser.add_argument("--online", action=argparse.BooleanOptionalAction, default=False,
-                        help="Train directly from JSONL with frozen DenseOn; no embedding files")
-    parser.add_argument("--index-dir", help="Compact JSONL offsets/token-count index for online training")
+                        help="Train from JSONL or pretokenized .pt with frozen DenseOn; no embedding files")
+    parser.add_argument("--index-dir", help="Compact record offsets/token-count index for online training")
     parser.add_argument("--index-only", action="store_true",
                         help="Build/validate the online text index on CPU, without loading DenseOn weights")
-    parser.add_argument("--texts-jsonl", type=str, nargs="+",
-                        help="Text JSONL files for --online training or --prepare offline caching")
+    parser.add_argument("--texts-jsonl", "--inputs", dest="texts_jsonl", type=str, nargs="+",
+                        help="Mixed .jsonl/.pt files for --online; only JSONL for --prepare offline caching")
     parser.add_argument("--encode-batch-size", type=int)
     parser.add_argument("--dataset-revisions", help="JSON file mapping dataset repositories to exact revisions")
     parser.add_argument("--resume", help="Path to a training_state.pt from this trainer")
@@ -1055,6 +1119,8 @@ def parse_args(argv=None):
                 raise ValueError("--texts-jsonl requires --prepare or --online and at least one input file")
             if args.dataset_revisions:
                 raise ValueError("dataset_revisions applies to HF tables, not --texts-jsonl input")
+            if args.prepare and any(Path(path).suffix.lower() == ".pt" for path in args.texts_jsonl):
+                raise ValueError("Pretokenized .pt input requires --online, not --prepare")
         if min(args.save_steps, args.log_steps, args.buffer_tokens, args.encode_batch_size) < 1:
             raise ValueError("Step counts, buffer size, and encoding batch size must be positive")
         if args.stop_after is not None and args.stop_after < 1:

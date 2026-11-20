@@ -51,7 +51,8 @@ saves the effective settings in `run_config.json`. Use `--help` for available fl
 The launcher trains online: frozen DenseOn encodes batches of texts, and the SAE
 learns from their token vectors held temporarily in memory. It does not write a
 full embedding cache. Edit the constants at the top of `run_pretraining.sh`, then
-run `bash run_pretraining.sh`. Set `TEXTS_JSONL` to one or more local JSONL files,
+run `bash run_pretraining.sh`. Set `TEXTS_JSONL` to local `.jsonl` files,
+pretokenized `.pt` descriptors, or a mixture of both,
 `INDEX_DIR` to the compact text index, and `SAE_OUTPUT` to a fresh output directory.
 
 The SAE config selects DenseOn and AuxK, with 32,768 latents, token top-k 32,
@@ -61,6 +62,99 @@ settings and three epochs, with **192-token query/document limits** and
 they are separate from the 4,096 token vectors used in each global SAE update.
 Reduce the encoding batch if GPU memory is insufficient. The launcher passes
 its editable settings as CLI arguments, overriding the corresponding JSON values.
+
+#### Compact pretokenized inputs (no text JSONL required)
+
+To avoid saving large text exports, tokenize the three corpora directly on CPU:
+
+```bash
+pip install -e '.[data]'
+python scripts/sae-pretrain/prepare_input_ids.py --source msmarco-v1
+python scripts/sae-pretrain/prepare_input_ids.py --source msmarco-v2
+python scripts/sae-pretrain/prepare_input_ids.py --source fineweb
+```
+
+These commands write `data/msmarco-v1.pt`, `data/msmarco-v2.pt` and
+`data/fineweb.pt`. FineWeb streams from the same pinned SmolLM-Corpus release as
+the text exporter; MSMARCO uses the same `ir_datasets` passage collections.
+Only raw passage text is tokenized, without titles. `ir_datasets` may still cache
+its upstream corpus download, but this path creates no intermediate JSONL.
+Preparation loads the tokenizer, never DenseOn weights or dense embeddings.
+
+You can also pass dataset IDs directly instead of using a preset:
+
+```bash
+python scripts/sae-pretrain/prepare_input_ids.py \
+    --source ir-datasets --dataset-id msmarco-passage \
+    --source-label msmarco_v1 --output data/msmarco-v1.pt
+
+python scripts/sae-pretrain/prepare_input_ids.py \
+    --source huggingface --dataset-id HuggingFaceTB/smollm-corpus \
+    --dataset-config fineweb-edu-dedup --split train --text-field text \
+    --revision 3ba9d605774198c5868892d7a8deda78031a781f \
+    --source-label fineweb --output data/fineweb.pt
+```
+
+These are alternatives to the preset commands. Generic `ir-datasets` inputs read
+`doc.text` from `docs_iter()`. Generic Hugging Face inputs stream one text column
+and use `--id-field id` by default, falling back to row numbers when IDs are absent.
+They are treated as documents. Without `--source-label`, the dataset ID becomes
+the stored source label. Without `--revision`, generic Hub inputs resolve `main`
+to an immutable commit recorded in the output; the `fineweb` preset stays pinned.
+
+Each `.pt` is a small descriptor referencing a sibling `NAME.shards/` directory.
+Keep the descriptor and its shard directory together when copying the data.
+Shards contain one flat tensor of packed token IDs (two bytes per token), offsets
+marking sequence boundaries, and source/role/ID metadata. They contain no text,
+padding, attention masks, or embeddings. Batch padding and masks are reconstructed
+before each DenseOn forward. Tensor shards are memory-mapped with a bounded open
+shard cache; the whole corpus is not loaded into RAM. A plain tensor saved with
+`torch.save()` is not sufficient: the descriptor records the tokenizer/settings
+needed to interpret it correctly. Serialized files use weights-only loading.
+
+Both length limits default to **192**, matching `run_pretraining.sh`. To prepare
+for 256-token training, add `--query-length 256 --document-length 256` to **each**
+preparation command, and set both limits to 256 in the launcher. Prompts, tokenizer
+revision and both limits must match exactly at training time; a mismatch fails
+early. Long texts are truncated with the same role-specific prompts and special
+tokens as the JSONL path. Different limits require a new tokenized export.
+Current `.pt` support is for the English DenseOn backbone without token skip lists.
+
+Replace the entries at the top of `run_pretraining.sh`, for example:
+
+```bash
+TEXTS_JSONL=(
+    "data/msmarco-v1.pt"
+    "data/msmarco-v2.pt"
+    "data/fineweb.pt"
+    # "data/msmarco-v1-artificial-queries-0.jsonl"
+)
+INDEX_DIR="data/slideon-pretokenized-index"
+SAE_OUTPUT="outputs/slideon-sae-pretokenized"
+```
+
+Then run `bash run_pretraining.sh`. The array keeps its original name; each file's
+suffix selects the loader. The Python CLI also accepts `--inputs` as an alias for
+`--texts-jsonl`. Use a fresh index/output when switching an existing run's inputs.
+Shuffling, frozen DenseOn encoding, SAE updates and the final checkpoint format
+are unchanged. Fine-tune by pointing `SAE_ID_OR_PATH` in `run_finetune.sh` at
+`outputs/slideon-sae-pretokenized/final`.
+
+Existing JSONL files (including generated queries) can also be tokenized:
+
+```bash
+python scripts/sae-pretrain/prepare_input_ids.py --source jsonl \
+    --texts-jsonl data/msmarco-v1-artificial-queries-0.jsonl \
+    --output data/msmarco-v1-artificial-queries-0.pt
+```
+
+Use `--limit 1000` for a small preparation check, `--tokenize-batch-size` to control
+CPU tokenization batches, and `--shard-tokens` to control shard size. The default
+is eight million input tokens per shard. Completed outputs are not overwritten;
+choose another output path for a new export. Preparation restarts from the
+beginning after interruption; a hard kill may leave `.partial` outputs to remove.
+
+#### Raw JSONL inputs
 
 Each JSONL line is an independent text, for example:
 
@@ -104,7 +198,7 @@ export selected parts, or omit `--input-dir` when the pickles are already in
 `data/`. The other three files contain documents. The launcher lists these three
 corpora by default, with optional query-part lines ready to uncomment.
 
-All exporters accept `--limit N` for small output checks and `--overwrite` to
+The JSONL exporters accept `--limit N` for small output checks and `--overwrite` to
 replace a completed export. A limit does not necessarily limit upstream downloads:
 `ir_datasets` may download the collection before yielding its first passage.
 Failures do not publish a partial final JSONL. Export restarts from the beginning;
@@ -122,6 +216,8 @@ an index of approximately 16 bytes per text plus metadata, without running
 DenseOn or saving embeddings. The index supports random text access and is
 checked for compatibility on reuse. Keep it under `data/`, as in the launcher,
 to keep generated index files out of Git.
+For `.pt` inputs the index reads saved sequence lengths without retokenizing;
+fingerprints cover the descriptor and every tensor shard.
 
 Each epoch shuffles all texts without replacement and visits each once. Frozen
 DenseOn encodes them in batches; retained token vectors are shuffled in a bounded
